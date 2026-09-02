@@ -10,6 +10,12 @@ import {
   getAutumnRateLimiter,
   getRateLimiter,
 } from "../../services/rate-limiter";
+import {
+  consumeKeylessRequest,
+  isKeylessConfigured,
+  keylessConversionCohort,
+} from "../../lib/keyless";
+import { logger } from "../../lib/logger";
 import { db } from "../../db/connection";
 import { autumnService } from "../../services/autumn/autumn.service";
 
@@ -45,9 +51,35 @@ vi.mock("../../db/rpc", () => ({
   authCreditUsageChunkFromTeam: vi.fn(),
 }));
 
-vi.mock("../../services/rate-limiter", () => ({
-  getRateLimiter: vi.fn(),
-  getAutumnRateLimiter: vi.fn(),
+// The limiter builders are mocked, but getRateLimitOverride is kept real: it is
+// the single source of truth for override resolution, and auth.ts calls it to
+// decide whether the Autumn multiplier is needed at all. Stub ioredis so
+// importing the real module doesn't open a connection.
+vi.mock("ioredis", () => ({
+  default: class {},
+}));
+
+vi.mock("../../services/rate-limiter", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("../../services/rate-limiter")>();
+  return {
+    ...actual,
+    getRateLimiter: vi.fn(),
+    getAutumnRateLimiter: vi.fn(),
+  };
+});
+
+vi.mock("../../lib/keyless", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../lib/keyless")>();
+  return {
+    ...actual,
+    consumeKeylessRequest: vi.fn(),
+    isKeylessConfigured: vi.fn(),
+  };
+});
+
+vi.mock("../../lib/spur", () => ({
+  isKeylessIpSuspicious: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("../../services/autumn/autumn.service", () => ({
@@ -63,12 +95,16 @@ vi.mock("../../services/agent-sponsor", () => ({
 describe("authenticateUser", () => {
   const originalUseDbAuth = config.USE_DB_AUTHENTICATION;
   const originalKeylessProxySecret = config.KEYLESS_PROXY_SECRET;
+  const originalKeylessConversionHmacSecret =
+    config.KEYLESS_CONVERSION_HMAC_SECRET;
   const originalMcpDelegatedCredentialSecret =
     config.MCP_DELEGATED_CREDENTIAL_SECRET;
   const originalIntrospectUrl = config.OAUTH_INTROSPECT_URL;
   const originalIntrospectSecret = config.OAUTH_INTROSPECT_SECRET;
+  const originalPreviewToken = config.PREVIEW_TOKEN;
 
   beforeEach(() => {
+    vi.mocked(isKeylessConfigured).mockReturnValue(false);
     vi.mocked(autumnService.getRateLimitMultiplier).mockResolvedValue(1);
     vi.mocked(getAutumnRateLimiter).mockReturnValue({
       consume: vi.fn().mockResolvedValue(undefined),
@@ -78,10 +114,12 @@ describe("authenticateUser", () => {
   afterEach(() => {
     config.USE_DB_AUTHENTICATION = originalUseDbAuth;
     config.KEYLESS_PROXY_SECRET = originalKeylessProxySecret;
+    config.KEYLESS_CONVERSION_HMAC_SECRET = originalKeylessConversionHmacSecret;
     config.MCP_DELEGATED_CREDENTIAL_SECRET =
       originalMcpDelegatedCredentialSecret;
     config.OAUTH_INTROSPECT_URL = originalIntrospectUrl;
     config.OAUTH_INTROSPECT_SECRET = originalIntrospectSecret;
+    config.PREVIEW_TOKEN = originalPreviewToken;
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -125,6 +163,46 @@ describe("authenticateUser", () => {
         api_key_id: 0,
         team_id: "bypass",
         is_extract: true,
+      }),
+    );
+  });
+
+  it("logs a conversion cohort for middleware keyless quota exhaustion", async () => {
+    config.USE_DB_AUTHENTICATION = true;
+    config.KEYLESS_CONVERSION_HMAC_SECRET = "a".repeat(32);
+    vi.mocked(isKeylessConfigured).mockReturnValue(true);
+    vi.mocked(consumeKeylessRequest).mockResolvedValue({
+      ok: false,
+      reason: "requests",
+      requestsUsed: 10,
+      creditsUsed: 2,
+      retryAfterSeconds: 42,
+    });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+    const auth = await authenticateUser(
+      {
+        headers: {},
+        socket: { remoteAddress: "203.0.113.8" },
+      },
+      {},
+      RateLimiterMode.Scrape,
+      { allowKeyless: true },
+    );
+
+    expect(auth).toEqual(
+      expect.objectContaining({
+        success: false,
+        status: 429,
+        keylessReason: "requests",
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      "Keyless request blocked",
+      expect.objectContaining({
+        event: "keyless_exhausted",
+        reason: "requests",
+        conversionCohort: keylessConversionCohort("203.0.113.8"),
       }),
     );
   });
@@ -432,6 +510,105 @@ describe("authenticateUser", () => {
       error: "Unauthorized: Invalid token",
       status: 401,
     });
+  });
+
+  it("passes the org rate-limit overrides to the API-key rate limiter", async () => {
+    config.USE_DB_AUTHENTICATION = true;
+    vi.mocked(getValue).mockResolvedValue(null);
+    const flags = { rateLimitOverrides: { scrape: 42 } };
+    vi.mocked(authCreditUsageChunk).mockResolvedValue([
+      {
+        api_key: "00000000-0000-4000-8000-000000000000",
+        api_key_id: 1,
+        team_id: "team-1",
+        org_id: "org-1",
+        flags,
+      },
+    ]);
+    vi.mocked(redlock.using).mockImplementation(
+      async (_keys, _ttl, _options, fn) => fn({ aborted: false } as never),
+    );
+    vi.mocked(autumnService.getRateLimitMultiplier).mockResolvedValue(50);
+
+    const auth = await authenticateUser(
+      {
+        headers: {
+          authorization: "Bearer 00000000-0000-4000-8000-000000000000",
+        },
+        socket: { remoteAddress: "127.0.0.1" },
+      },
+      {},
+      RateLimiterMode.Scrape,
+    );
+
+    expect(auth.success).toBe(true);
+    // The override replaces the whole base × multiplier computation, so the
+    // Autumn multiplier is never fetched and a neutral 1 is passed instead.
+    expect(autumnService.getRateLimitMultiplier).not.toHaveBeenCalled();
+    expect(getAutumnRateLimiter).toHaveBeenCalledWith(
+      RateLimiterMode.Scrape,
+      1,
+      flags,
+    );
+  });
+
+  it("still fetches the Autumn multiplier when no override covers the mode", async () => {
+    config.USE_DB_AUTHENTICATION = true;
+    vi.mocked(getValue).mockResolvedValue(null);
+    const flags = { rateLimitOverrides: { crawl: 42 } };
+    vi.mocked(authCreditUsageChunk).mockResolvedValue([
+      {
+        api_key: "00000000-0000-4000-8000-000000000000",
+        api_key_id: 1,
+        team_id: "team-1",
+        org_id: "org-1",
+        flags,
+      },
+    ]);
+    vi.mocked(redlock.using).mockImplementation(
+      async (_keys, _ttl, _options, fn) => fn({ aborted: false } as never),
+    );
+    vi.mocked(autumnService.getRateLimitMultiplier).mockResolvedValue(50);
+
+    const auth = await authenticateUser(
+      {
+        headers: {
+          authorization: "Bearer 00000000-0000-4000-8000-000000000000",
+        },
+        socket: { remoteAddress: "127.0.0.1" },
+      },
+      {},
+      RateLimiterMode.Scrape,
+    );
+
+    expect(auth.success).toBe(true);
+    expect(autumnService.getRateLimitMultiplier).toHaveBeenCalledTimes(1);
+    expect(getAutumnRateLimiter).toHaveBeenCalledWith(
+      RateLimiterMode.Scrape,
+      50,
+      flags,
+    );
+  });
+
+  it("leaves the preview token on the static rate limiter", async () => {
+    config.USE_DB_AUTHENTICATION = true;
+    config.PREVIEW_TOKEN = "preview-token";
+    vi.mocked(getRateLimiter).mockReturnValue({
+      consume: vi.fn().mockResolvedValue(undefined),
+    } as never);
+
+    const auth = await authenticateUser(
+      {
+        headers: { authorization: "Bearer preview-token" },
+        socket: { remoteAddress: "127.0.0.1" },
+      },
+      {},
+      RateLimiterMode.Scrape,
+    );
+
+    expect(auth.success).toBe(true);
+    expect(getRateLimiter).toHaveBeenCalledWith(RateLimiterMode.Preview);
+    expect(getAutumnRateLimiter).not.toHaveBeenCalled();
   });
 
   it("clears purpose-qualified and legacy ACUC cache entries", async () => {

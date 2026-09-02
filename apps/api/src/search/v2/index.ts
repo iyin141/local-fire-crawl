@@ -9,6 +9,7 @@ import { Logger } from "winston";
 export async function search({
   query,
   logger,
+  requestId,
   advanced = false,
   num_results = 5,
   tbs = undefined,
@@ -16,6 +17,7 @@ export async function search({
   lang = "en",
   country = "us",
   location = undefined,
+  safe = undefined,
   proxy = undefined,
   sleep_interval = 0,
   timeout = 5000,
@@ -24,6 +26,7 @@ export async function search({
 }: {
   query: string;
   logger: Logger;
+  requestId?: string;
   advanced?: boolean;
   num_results?: number;
   tbs?: string;
@@ -31,6 +34,7 @@ export async function search({
   lang?: string;
   country?: string;
   location?: string;
+  safe?: boolean;
   proxy?: string;
   sleep_interval?: number;
   timeout?: number;
@@ -41,12 +45,14 @@ export async function search({
     if (config.FIRE_ENGINE_BETA_URL) {
       logger.info("Using fire engine search");
       const results = await fire_engine_search_v2(query, {
+        requestId,
         numResults: num_results,
         tbs,
         filter,
         lang,
         country,
         location,
+        safe,
         type,
         enterprise,
       });
@@ -63,6 +69,7 @@ export async function search({
         lang,
         country,
         location,
+        safe,
       });
       if (results.web && results.web.length > 0) return results;
     }

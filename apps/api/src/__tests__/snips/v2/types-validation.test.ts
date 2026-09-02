@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   scrapeRequestSchema,
+  parseRequestSchema,
   scrapeOptions,
   extractRequestSchema,
   crawlRequestSchema,
@@ -81,6 +82,22 @@ describe("V2 Types Validation", () => {
 
       const result = scrapeRequestSchema.parse(input);
       expect(result.formats).toEqual([{ type: "markdown" }, { type: "html" }]);
+    });
+
+    it("should only allow rawBase64 as the sole format", () => {
+      expect(
+        scrapeRequestSchema.parse({
+          url: "https://example.com/file",
+          formats: ["rawBase64"],
+        }).formats,
+      ).toEqual([{ type: "rawBase64" }]);
+
+      expect(() =>
+        scrapeRequestSchema.parse({
+          url: "https://example.com/file",
+          formats: ["markdown", "rawBase64"],
+        }),
+      ).toThrow("The rawBase64 format cannot be combined with other formats");
     });
 
     it("should accept video format as string and object", () => {
@@ -435,6 +452,40 @@ describe("V2 Types Validation", () => {
       expect((result.parsers as any)[0].maxPages).toBe(100);
     });
 
+    it("should accept physical page markdown for PDF parsers", () => {
+      const result = scrapeRequestSchema.parse({
+        url: "https://example.com/file.pdf",
+        parsers: [{ type: "pdf", mode: "auto", pages: true }],
+      });
+
+      expect((result.parsers as any)[0].pages).toBe(true);
+    });
+
+    it("should fold the deprecated pageMarkdown alias into pages", () => {
+      const result = scrapeRequestSchema.parse({
+        url: "https://example.com/file.pdf",
+        parsers: [{ type: "pdf", mode: "auto", pageMarkdown: true }],
+      });
+
+      expect((result.parsers as any)[0].pages).toBe(true);
+      expect("pageMarkdown" in (result.parsers as any)[0]).toBe(false);
+    });
+
+    it("should reject non-boolean physical page markdown", () => {
+      expect(() =>
+        scrapeRequestSchema.parse({
+          url: "https://example.com/file.pdf",
+          parsers: [{ type: "pdf", pages: "yes" }],
+        }),
+      ).toThrow();
+      expect(() =>
+        scrapeRequestSchema.parse({
+          url: "https://example.com/file.pdf",
+          parsers: [{ type: "pdf", pageMarkdown: "yes" }],
+        }),
+      ).toThrow();
+    });
+
     it("should reject PDF parser with maxPages exceeding limit", () => {
       const input: ScrapeRequestInput = {
         url: "https://example.com",
@@ -648,6 +699,22 @@ describe("V2 Types Validation", () => {
         const result = scrapeRequestSchema.parse(input);
         expect(result.lockdown).toBe(true);
       });
+    });
+  });
+
+  describe("parseRequestSchema", () => {
+    it("should reject rawBase64 for file uploads", () => {
+      expect(() =>
+        parseRequestSchema.parse({
+          formats: ["rawBase64"],
+          file: {
+            buffer: Buffer.from("raw upload"),
+            filename: "upload.html",
+            contentType: "text/html",
+            kind: "html",
+          },
+        }),
+      ).toThrow("The rawBase64 format is not supported for parse uploads");
     });
   });
 
@@ -1090,9 +1157,18 @@ describe("V2 Types Validation", () => {
       expect(
         searchRequestSchema.parse({
           query: "test",
-          categories: ["docs", "github", "developer_index"],
+          categories: ["docs", "developer_index"],
         }).categories,
-      ).toEqual([{ type: "developer" }, { type: "github" }]);
+      ).toEqual([{ type: "developer" }]);
+
+      // Developer (and its aliases) is exclusive: combining with any other
+      // category is rejected at the schema.
+      expect(() =>
+        searchRequestSchema.parse({
+          query: "test",
+          categories: ["docs", "github", "developer_index"],
+        }),
+      ).toThrow(/cannot be combined/);
     });
 
     it("should reject developer alias params and unknown categories", () => {

@@ -30,6 +30,7 @@ import { QueueFullError } from "./lib/queue-full-error";
 import { v7 as uuidv7 } from "uuid";
 import { cacheableLookup } from "./scraper/scrapeURL/lib/cacheableLookup";
 import { v2Router } from "./routes/v2";
+import { exchangeRouter } from "./routes/exchange";
 import { labsRouter } from "./routes/labs";
 import { registerMcpActionLogIngestRoute } from "./routes/mcp-action-logs";
 import { startMcpActionLogRetentionWorkerIfEnabled } from "./services/mcp/action-logs";
@@ -42,6 +43,7 @@ import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forci
 import responseTime from "response-time";
 import { shutdownWebhookQueue } from "./services/webhook";
 import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
+import { isKeylessConfigured } from "./lib/keyless";
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -53,6 +55,12 @@ logger.info(`Number of CPUs: ${numCPUs} available`);
 logger.info("Network info dump", {
   networkInterfaces: os.networkInterfaces(),
 });
+
+if (isKeylessConfigured() && !config.KEYLESS_CONVERSION_HMAC_SECRET) {
+  logger.warn(
+    "Keyless conversion cohort logging is disabled: set KEYLESS_CONVERSION_HMAC_SECRET to enable privacy-safe quota-to-account measurement",
+  );
+}
 
 // Install cacheable lookup for all other requests
 cacheableLookup.install(http.globalAgent);
@@ -132,6 +140,7 @@ app.use(v0Router);
 app.use("/v1", v1Router);
 app.use("/v2", v2Router);
 app.use("/labs", labsRouter);
+app.use("/exchange", exchangeRouter);
 app.use(adminRouter);
 
 const DEFAULT_PORT = config.PORT;

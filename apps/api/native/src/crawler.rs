@@ -135,6 +135,45 @@ fn is_file(path: &str) -> bool {
   }
 }
 
+static DOCUMENT_SEGMENT: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"\.[A-Za-z0-9]{2,}$").unwrap());
+
+struct CrawlScope {
+  prefix: String,
+  exact: Option<String>,
+}
+
+/// Resolves the path a crawl is scoped to when backward crawling is disabled.
+/// Keep in sync with getCrawlScope() in apps/api/src/lib/crawl-scope.ts.
+fn crawl_scope(initial_url: &Url) -> CrawlScope {
+  let path = initial_url.path();
+
+  if path.ends_with('/') {
+    return CrawlScope {
+      prefix: path.to_string(),
+      exact: None,
+    };
+  }
+
+  let last_slash = path.rfind('/').map_or(0, |i| i + 1);
+  if DOCUMENT_SEGMENT.is_match(&path[last_slash..]) {
+    return CrawlScope {
+      prefix: path[..last_slash].to_string(),
+      exact: None,
+    };
+  }
+
+  CrawlScope {
+    prefix: format!("{path}/"),
+    exact: Some(path.to_string()),
+  }
+}
+
+#[inline]
+fn is_within_crawl_scope(path: &str, scope: &CrawlScope) -> bool {
+  scope.exact.as_deref() == Some(path) || path.starts_with(&scope.prefix)
+}
+
 #[inline]
 fn get_url_depth(path: &str) -> u32 {
   path
@@ -257,7 +296,7 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
   let base_url = Url::parse(&data.base_url).map_err(|e| format!("Base URL parse error: {e}"))?;
   let initial_url =
     Url::parse(&data.initial_url).map_err(|e| format!("Initial URL parse error: {e}"))?;
-  let initial_path = initial_url.path();
+  let scope = crawl_scope(&initial_url);
 
   let excludes_regex: Vec<Regex> = data
     .excludes
@@ -317,7 +356,7 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
         continue;
       }
 
-      if !data.allow_backward_crawling && !path.starts_with(initial_path) {
+      if !data.allow_backward_crawling && !is_within_crawl_scope(path, &scope) {
         denial_reasons.insert(link, BACKWARD_CRAWLING.to_string());
         continue;
       }
@@ -542,9 +581,14 @@ fn _filter_url(data: FilterUrlCall) -> std::result::Result<FilterUrlResult, Stri
       }
     };
 
-    if is_internal_link(&context_url, &base_url)
-      && data.allow_external_content_links
+    // Allow an external destination when external content links are enabled and
+    // it is not an external site's homepage. Two cases qualify: the link was
+    // found on an in-scope page, or an already-admitted external link redirected
+    // within its own registrable domain (its canonical URL or a subdomain of
+    // it), matched via the same PSL check used for allowSubdomains.
+    if data.allow_external_content_links
       && !is_external_main_page(url_str)
+      && (is_internal_link(&context_url, &base_url) || is_subdomain(&url, &context_url) || is_internal_link(&url, &context_url))
     {
       return Ok(FilterUrlResult {
         allowed: true,
@@ -752,6 +796,54 @@ pub async fn process_sitemap(xml_content: String) -> Result<SitemapProcessingRes
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn scope_of(url: &str) -> CrawlScope {
+    crawl_scope(&Url::parse(url).unwrap())
+  }
+
+  #[test]
+  fn test_crawl_scope_document_seed_scopes_to_directory() {
+    let scope = scope_of("https://example.com/docs/guide.md");
+    assert_eq!(scope.prefix, "/docs/");
+    assert_eq!(scope.exact, None);
+
+    assert!(is_within_crawl_scope("/docs/other.md", &scope));
+    assert!(is_within_crawl_scope("/docs/nested/deep.md", &scope));
+    assert!(!is_within_crawl_scope("/blog/post.md", &scope));
+    assert!(!is_within_crawl_scope("/", &scope));
+  }
+
+  #[test]
+  fn test_crawl_scope_directory_seed() {
+    let scope = scope_of("https://example.com/docs/");
+    assert_eq!(scope.prefix, "/docs/");
+    assert_eq!(scope.exact, None);
+
+    assert!(is_within_crawl_scope("/docs/guide.md", &scope));
+    assert!(!is_within_crawl_scope("/docs", &scope));
+    assert!(!is_within_crawl_scope("/docsearch/x", &scope));
+  }
+
+  #[test]
+  fn test_crawl_scope_extensionless_seed_allows_seed_and_children() {
+    let scope = scope_of("https://example.com/docs");
+    assert_eq!(scope.prefix, "/docs/");
+    assert_eq!(scope.exact.as_deref(), Some("/docs"));
+
+    assert!(is_within_crawl_scope("/docs", &scope));
+    assert!(is_within_crawl_scope("/docs/guide", &scope));
+    // Sibling paths sharing the seed's prefix must not sneak in.
+    assert!(!is_within_crawl_scope("/docsearch", &scope));
+  }
+
+  #[test]
+  fn test_crawl_scope_root_seed() {
+    let scope = scope_of("https://example.com");
+    assert_eq!(scope.prefix, "/");
+    assert_eq!(scope.exact, None);
+
+    assert!(is_within_crawl_scope("/anything/at/all", &scope));
+  }
 
   #[test]
   fn test_parse_sitemap_xml_urlset() {
@@ -1106,5 +1198,88 @@ mod tests {
     assert!(is_file("style.css"));
     assert!(!is_file("page"));
     assert!(!is_file("directory/"));
+  }
+
+  fn filter_url_call(href: &str, url: &str, base_url: &str) -> FilterUrlCall {
+    FilterUrlCall {
+      href: href.to_string(),
+      url: url.to_string(),
+      base_url: base_url.to_string(),
+      excludes: vec![],
+      ignore_robots_txt: true,
+      robots_txt: "".to_string(),
+      robots_user_agent: None,
+      allow_external_content_links: true,
+      allow_subdomains: false,
+    }
+  }
+
+  // A discovered external link that redirects within its own domain (the
+  // redirect target's URL and its source URL are both external to the crawl
+  // seed) must be allowed under allowExternalLinks. Regression test for #4315.
+  #[test]
+  fn test_filter_url_allows_external_link_redirect_same_domain() {
+    let result = _filter_url(filter_url_call(
+      "http://www.iana.org/help/example-domains",
+      "https://iana.org/domains/example",
+      "https://example.org",
+    ))
+    .unwrap();
+    assert!(result.allowed);
+    assert!(result.denial_reason.is_none());
+  }
+
+  // A redirect that stays within the source's registrable domain but changes to
+  // a real subdomain must be allowed (PSL-based, not just stripping "www.").
+  #[test]
+  fn test_filter_url_allows_external_link_redirect_to_subdomain() {
+    let result = _filter_url(filter_url_call(
+      "https://blog.example.com/post",
+      "https://example.com/link",
+      "https://crawlseed.org",
+    ))
+    .unwrap();
+    assert!(result.allowed);
+  }
+
+  // Same as above but the redirect keeps the exact hostname, only changing the
+  // path (the london.gov.uk case from #4315).
+  #[test]
+  fn test_filter_url_allows_external_link_redirect_same_host_path_change() {
+    let result = _filter_url(filter_url_call(
+      "https://www.london.gov.uk/programmes-strategies/planning/london-plan",
+      "https://www.london.gov.uk/what-we-do/planning/london-plan",
+      "https://example.org",
+    ))
+    .unwrap();
+    assert!(result.allowed);
+  }
+
+  // An in-scope URL that redirects to an unrelated external homepage stays
+  // denied — the external-main-page exclusion is intentional (#4316).
+  #[test]
+  fn test_filter_url_denies_redirect_to_external_homepage() {
+    let result = _filter_url(filter_url_call(
+      "https://www.peoplefirstinfo.org.uk/",
+      "https://www.westminster.gov.uk/node/21229",
+      "https://www.westminster.gov.uk",
+    ))
+    .unwrap();
+    assert!(!result.allowed);
+    assert_eq!(result.denial_reason.unwrap(), "EXTERNAL_LINK");
+  }
+
+  // A redirect that hops to an unrelated external domain (not the source's own
+  // domain, not in scope) remains denied.
+  #[test]
+  fn test_filter_url_denies_redirect_to_unrelated_external_domain() {
+    let result = _filter_url(filter_url_call(
+      "https://unrelated.com/article",
+      "https://iana.org/domains/example",
+      "https://example.org",
+    ))
+    .unwrap();
+    assert!(!result.allowed);
+    assert_eq!(result.denial_reason.unwrap(), "EXTERNAL_LINK");
   }
 }

@@ -1,4 +1,5 @@
 import { Response } from "express";
+import { externalRequestId } from "../../lib/external-request-id";
 import { config } from "../../config";
 import {
   RequestWithAuth,
@@ -8,8 +9,8 @@ import {
 } from "./types";
 import { billTeam } from "../../services/billing/credit_billing";
 import {
-  KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   adjustKeylessCredits,
+  keylessLimitBody,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
@@ -41,6 +42,7 @@ import {
 } from "../../lib/key-restriction";
 import { wantsDeveloperCategory } from "../../search/developer";
 import { requestOrigin } from "../../lib/request-origin";
+import { isAgentInteropSecretValid } from "../../lib/agent-interop";
 
 export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
@@ -75,28 +77,6 @@ export async function searchController(
     const rawOrigin =
       typeof req.body?.origin === "string" ? req.body.origin : undefined;
     req.body = searchRequestSchema.parse(req.body);
-
-    // Beta gate: the developer category is limited to teams with the
-    // developerBeta flag. Fail closed and silent — an unentitled team gets
-    // normal web results with the category dropped, no error. Keyless callers
-    // have no org and so no flags, which makes them unentitled. Runs before
-    // the key-restriction check below so an unentitled team is never told its
-    // key lacks access to a category that is about to be removed anyway.
-    if (wantsDeveloperCategory(req.body.categories as CategoryOption[])) {
-      if (req.acuc?.flags?.developerBeta !== true) {
-        // Expected, high-volume path (keyless + unentitled teams) — left
-        // unlogged on purpose to avoid log spam. See PR discussion.
-        // filter() widens the union that categories is declared as (either an
-        // all-string or an all-object array), so the result is cast back to
-        // assign it.
-        req.body.categories = (req.body.categories as CategoryOption[]).filter(
-          category =>
-            typeof category === "string"
-              ? category !== "developer"
-              : category.type !== "developer",
-        ) as typeof req.body.categories;
-      }
-    }
 
     const requestedFormats = formatTypesOf(req.body.scrapeOptions?.formats);
     const keyRestriction = await checkKeyFormatRestriction(
@@ -133,7 +113,7 @@ export async function searchController(
     if (
       req.body.__agentInterop &&
       config.AGENT_INTEROP_SECRET &&
-      req.body.__agentInterop.auth !== config.AGENT_INTEROP_SECRET
+      !isAgentInteropSecretValid(req.body.__agentInterop.auth)
     ) {
       return res.status(403).json({
         success: false,
@@ -202,11 +182,17 @@ export async function searchController(
       }
     }
 
+    // Kick off the `requests` row insert without blocking: it queues on the
+    // Postgres pool and can take seconds under pool pressure. We only need it
+    // committed before the child-row writes (logSearch et al. below) to keep
+    // the request_id FK ordering — same pattern as the scrape controllers.
+    let logRequestPromise: Promise<void> | undefined;
     if (!agentRequestId) {
-      await logRequest({
+      logRequestPromise = logRequest({
         id: jobId,
         kind: "search",
         api_version: "v2",
+        external_request_id: externalRequestId(req),
         team_id: req.auth.team_id,
         origin: req.body.origin ?? "api",
         integration: req.body.integration,
@@ -235,10 +221,9 @@ export async function searchController(
       );
       if (!reservation.ok) {
         applyAgentAuthDiscoveryHeader(res);
-        return res.status(429).json({
-          success: false,
-          error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
-        });
+        return res
+          .status(429)
+          .json(await keylessLimitBody(req.auth.team_id, "v2_search"));
       }
       reservedKeylessCredits = projectedKeylessCredits;
     }
@@ -252,6 +237,7 @@ export async function searchController(
         lang: req.body.lang,
         country: req.body.country,
         location: req.body.location,
+        safe: req.body.safe,
         sources: req.body.sources as Array<{ type: string }>,
         categories: req.body.categories as CategoryOption[],
         includeDomains: req.body.includeDomains,
@@ -287,7 +273,7 @@ export async function searchController(
         req.auth.team_id,
         result.searchCredits,
         req.acuc?.api_key_id ?? null,
-        billing,
+        { ...billing, chargeId: jobId },
       ).catch(error =>
         logger.error("Failed to bill team for search credits", {
           teamId: req.auth.team_id,
@@ -311,6 +297,18 @@ export async function searchController(
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - middlewareStartTime) / 1000;
 
+    // Ensure the parent `requests` row is committed before the child
+    // `searches` insert, to avoid a request_id FK violation. The insert has
+    // been in flight since the top of the controller, so this is ~free in
+    // practice; robustInsert never rejects, so this await cannot throw.
+    const logStart = Date.now();
+    await logRequestPromise;
+    const waited = Date.now() - logStart;
+    if (waited >= 5)
+      logger.warn("Had to wait for log request promise to complete", {
+        timeMs: waited,
+      });
+
     logSearch(
       {
         id: jobId,
@@ -323,7 +321,9 @@ export async function searchController(
         time_taken: timeTakenInSeconds,
         team_id: req.auth.team_id,
         options: req.body,
-        credits_cost: shouldBill ? result.searchCredits : 0,
+        // Don't record preview tokens as billed in the ledger — only record
+        // credits when billing is actually applied.
+        credits_cost: !isSearchPreview && shouldBill ? result.searchCredits : 0,
         zeroDataRetention,
       },
       false,
@@ -344,9 +344,11 @@ export async function searchController(
           via: "search_category",
         },
         response: null,
-        num_results: result.response.developer?.length ?? 0,
+        num_results: result.developerResultsCount,
         time_taken: timeTakenInSeconds,
-        credits_cost: 0,
+        // Ensure preview-mode searches don't get a non-zero credits_cost
+        // in the research ledger when preview tokens are used.
+        credits_cost: !isSearchPreview && shouldBill ? result.searchCredits : 0,
         is_successful: true,
         zeroDataRetention,
       }).catch(ledgerError => {

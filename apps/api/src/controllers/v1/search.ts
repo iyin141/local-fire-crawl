@@ -10,6 +10,7 @@ import {
 import { billTeam } from "../../services/billing/credit_billing";
 import { v7 as uuidv7 } from "uuid";
 import { logSearch, logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { search } from "../../search";
 import { logger as _logger } from "../../lib/logger";
 import {
@@ -34,8 +35,8 @@ import {
 import { fromV1ScrapeOptions } from "../v2/types";
 import { getSearchForcedKind } from "../../lib/zdr-helpers";
 import {
-  KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   adjustKeylessCredits,
+  keylessLimitBody,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
@@ -174,6 +175,7 @@ export async function searchController(
       id: jobId,
       kind: "search",
       api_version: "v1",
+      external_request_id: externalRequestId(req),
       team_id: req.auth.team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,
@@ -212,10 +214,9 @@ export async function searchController(
       );
       if (!reservation.ok) {
         applyAgentAuthDiscoveryHeader(res);
-        return res.status(429).json({
-          success: false,
-          error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
-        });
+        return res
+          .status(429)
+          .json(await keylessLimitBody(req.auth.team_id, "v1_search"));
       }
       reservedKeylessCredits = projectedKeylessCredits;
     }
@@ -285,7 +286,7 @@ export async function searchController(
         req.auth.team_id,
         result.searchCredits,
         req.acuc?.api_key_id ?? null,
-        { endpoint: "search", jobId },
+        { endpoint: "search", jobId, chargeId: jobId },
       ).catch(error => {
         logger.error(
           `Failed to bill team ${req.auth.team_id} for ${result.searchCredits} credits: ${error}`,

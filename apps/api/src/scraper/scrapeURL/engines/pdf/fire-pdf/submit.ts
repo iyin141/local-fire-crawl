@@ -4,7 +4,7 @@ import { fetch as undiciFetch } from "undici";
 import { AbortManagerThrownError } from "../../../lib/abortManager";
 import { firePdfAsyncSubmittedTotal } from "./metrics";
 import { submitResponseSchema } from "./schema";
-import { failAsync, firePdfHeaders } from "./utils";
+import { buildFirePdfJobOptions, failAsync, firePdfHeaders } from "./utils";
 
 type SubmitOutcome = {
   lane: string | undefined;
@@ -12,13 +12,24 @@ type SubmitOutcome = {
   alreadyDone: boolean;
 };
 
+/** How the PDF bytes reach fire-pdf: inline base64 for small files, or a
+ * GCS reference (pre-uploaded to fire-pdf's input bucket) for large ones.
+ * By-reference submits require a positive `pages_estimate` — fire-pdf has
+ * no bytes to probe at admission time. */
+type FirePdfSubmitInput =
+  | { kind: "inline"; base64Content: string }
+  | { kind: "byReference"; gcsUri: string; sha256: string };
+
 type SubmitArgs = {
   meta: Meta;
   baseUrl: string;
-  base64Content: string;
+  input: FirePdfSubmitInput;
   maxPages: number | undefined;
   pagesProcessed: number | undefined;
   mode: PDFMode | undefined;
+  includePageMarkdown: boolean;
+  includeBlocks: boolean;
+  pageMarkers: boolean;
   deadlineAt: string;
   /** Team's sold concurrency from the ACUC (ENG-5049 account context).
    * Optional: entitlement lookup must never block or fail a scrape. */
@@ -54,18 +65,35 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
   const {
     meta,
     baseUrl,
-    base64Content,
+    input,
     maxPages,
     pagesProcessed,
     mode,
+    includePageMarkdown,
+    includeBlocks,
+    pageMarkers,
     deadlineAt,
     teamConcurrency,
     fetchImpl,
   } = args;
   const scrapeId = meta.id;
 
+  if (
+    input.kind === "byReference" &&
+    (pagesProcessed === undefined || pagesProcessed <= 0)
+  ) {
+    // fire-pdf rejects by-reference submits without a positive
+    // pages_estimate (400 missing_pages_estimate); fail here with the
+    // clearer local error instead of a wire round-trip.
+    throw new Error(
+      "fire-pdf by-reference submit requires a positive pages estimate",
+    );
+  }
+
   const body = {
-    pdf_b64: base64Content,
+    ...(input.kind === "inline"
+      ? { pdf_b64: input.base64Content }
+      : { input_gcs_uri: input.gcsUri, input_sha256: input.sha256 }),
     scrape_id: scrapeId,
     source: "firecrawl" as const,
     zdr: false as const,
@@ -82,11 +110,16 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
     ...(teamConcurrency !== undefined && {
       team_concurrency: teamConcurrency,
     }),
-    options: {
-      ...(pagesProcessed !== undefined && { pages_estimate: pagesProcessed }),
-      ...(maxPages !== undefined && { max_pages: maxPages }),
-      ...(mode !== undefined && { mode }),
-    },
+    // Shared with the POST /jobs/lookup adoption client — the two must
+    // build identical options or adoption never matches this job.
+    options: buildFirePdfJobOptions({
+      maxPages,
+      pagesProcessed,
+      mode,
+      includePageMarkdown,
+      includeBlocks,
+      pageMarkers,
+    }),
   };
 
   let status: number;

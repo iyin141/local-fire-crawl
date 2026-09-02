@@ -58,8 +58,6 @@ function upstreamHeaders(req: RequestWithAuth<any, any, any>) {
   if (apiKey) headers["x-labs-search-key"] = apiKey;
 
   if (isMultipart(req)) {
-    // The body is piped through unparsed, so the multipart boundary and length
-    // have to travel with it.
     for (const h of ["content-type", "content-length"]) {
       const value = req.headers[h];
       if (typeof value === "string") headers[h] = value;
@@ -136,99 +134,107 @@ async function labsProxyController(req: Request, res: Response) {
 
 export const labsRouter = express.Router();
 
-// No credit check or billing here on purpose: the service behind this proxy
-// makes its own calls to the public API with the caller's own key, so usage is
-// billed on those existing paths instead.
-//
-// This list mirrors the upstream service one route at a time; there is no
-// catch-all. An endpoint added upstream stays a 404 here until it is also
-// listed below, so keep the two in sync when the service grows.
 labsRouter.post(
   "/search",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.post(
   "/search/data/sites",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.post(
   "/search/data/documents",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.post(
   "/search/data/pages",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.get(
   "/search/data",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.patch(
   "/search/data/:sourceId",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.delete(
   "/search/data/:sourceId",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.post(
   "/search/data/:sourceId/refresh",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.get(
   "/search/providers",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.get(
   "/search/packs",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.patch(
   "/search/packs/:packId",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.post(
   "/search/configs",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.get(
   "/search/configs",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.patch(
   "/search/configs/:id",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
 
 labsRouter.delete(
   "/search/configs/:id",
-  authMiddleware(RateLimiterMode.Search),
+  authMiddleware(RateLimiterMode.Labs),
   wrap(labsProxyController),
 );
+
+labsRouter.all(/(.*)/, (req: Request, res: Response) => {
+  rootLogger.warn("Labs path is not proxied by this API", {
+    module: "api/labs",
+    method: req.method,
+    path: req.originalUrl,
+  });
+  return res.status(404).json({
+    success: false,
+    code: "LABS_ROUTE_NOT_PROXIED",
+    error:
+      `${req.method} ${req.baseUrl}${req.path} is not routed by this API. The Labs Search ` +
+      `service may serve it, but this proxy does not forward it yet.`,
+  });
+});

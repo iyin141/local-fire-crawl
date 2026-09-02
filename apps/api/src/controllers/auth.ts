@@ -5,13 +5,19 @@ import { logger } from "../lib/logger";
 import { parseApi } from "../lib/parseApi";
 import { withAuth } from "../lib/withAuth";
 import { getAgentSponsorStatus } from "../services/agent-sponsor";
-import { getRateLimiter, getAutumnRateLimiter } from "../services/rate-limiter";
+import {
+  getRateLimiter,
+  getAutumnRateLimiter,
+  getRateLimitOverride,
+} from "../services/rate-limiter";
 import {
   KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   consumeKeylessRequest,
   isKeylessConfigured,
+  keylessExhaustionTelemetry,
   isKeylessIpEligible,
   keylessTeamId,
+  normalizeKeylessIpv4,
 } from "../lib/keyless";
 import { isKeylessIpSuspicious } from "../lib/spur";
 import { checkIpRestriction } from "../lib/ip-restriction";
@@ -25,7 +31,11 @@ import {
   AuthCreditUsageChunkRow,
 } from "../db/rpc";
 import { AuthResponse, RateLimiterMode } from "../types";
-import { AuthCreditUsageChunk, AuthCreditUsageChunkFromTeam } from "./v1/types";
+import {
+  AuthCreditUsageChunk,
+  AuthCreditUsageChunkFromTeam,
+  TeamFlags,
+} from "./v1/types";
 import {
   FIRECRAWL_REST_RESOURCE,
   OAuthIntrospectionUnavailableError,
@@ -186,11 +196,11 @@ async function getACUC(
     let retries = 0;
     const maxRetries = 5;
     while (retries < maxRetries) {
-      const database = requiresPrimaryRead
-        ? db
-        : Math.random() > 2 / 3
-          ? dbRr
-          : db;
+      // General-purpose reads prefer the replica: the result is Redis-cached
+      // for 10 minutes, so sub-second replication lag is irrelevant. Fall back
+      // to the primary on replica error. hosted_mcp_oauth must stay on the
+      // primary — revocation has to observe fresh state.
+      const database = requiresPrimaryRead ? db : retries === 0 ? dbRr : db;
       try {
         data = await authCreditUsageChunk(database, api_key, credentialPurpose);
         break;
@@ -310,7 +320,9 @@ export async function getACUCTeam(
     const maxRetries = 5;
 
     while (retries < maxRetries) {
-      const database = Math.random() > 2 / 3 ? dbRr : db;
+      // Prefer the replica (10-minute Redis cache makes lag irrelevant); fall
+      // back to the primary on replica error.
+      const database = retries === 0 ? dbRr : db;
       try {
         data = await authCreditUsageChunkFromTeam(database, team_id);
         break;
@@ -450,6 +462,10 @@ async function handleKeylessAuth(
   // usable as arbitrary limiter buckets. Anything else falls through to 401.
   if (!isKeylessIpEligible(ip)) return unauthorized;
 
+  // Canonicalize `::ffff:`-mapped IPv4 so a client gets one Spur cache entry,
+  // one quota bucket, and one team id regardless of how the socket reported it.
+  ip = normalizeKeylessIpv4(ip);
+
   // Optional Spur Context check (only when SPUR_API_KEY is set): refuse keyless
   // for IPs fronting anonymizing/rotating infrastructure (VPN/proxy/TOR), the
   // main way the per-IP caps get bypassed. Fails open on any Spur error, and
@@ -515,15 +531,19 @@ async function handleKeylessAuth(
     logger.warn("Keyless request blocked", {
       ...baseLog,
       blocked: true,
+      event: "keyless_exhausted",
       reason: result.reason,
+      retryAfterSeconds: result.retryAfterSeconds,
+      ...keylessExhaustionTelemetry(ip),
     });
     return {
       success: false,
       error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
       status: 429,
-      // Out of free quota — emit the OAuth-discovery header so agents can find
-      // the key/signup flow at the moment they actually need a key.
+      // Direct API callers receive discovery metadata; MCP maps this in-band.
       agentAuthDiscovery: true,
+      keylessReason: result.reason,
+      retryAfterSeconds: result.retryAfterSeconds,
     };
   }
 
@@ -565,14 +585,23 @@ export async function authenticateUser(
  * Builds the rate limiter for an authenticated team from its Autumn rate-limit
  * multiplier. Shared by the OAuth and API-key paths so their limiter setup
  * can't diverge.
+ *
+ * The org flags carry the optional per-endpoint override, so they are passed
+ * on to getAutumnRateLimiter, which stays the only place deciding the final
+ * limit. An override makes the multiplier irrelevant, so we skip fetching it
+ * from Autumn in that case rather than paying for a value that is discarded.
  */
 async function buildAuthenticatedRateLimiter(
   teamId: string,
   orgId: string | null | undefined,
   mode: RateLimiterMode,
+  flags: TeamFlags,
 ): Promise<RateLimiterRedis> {
-  const multiplier = await autumnService.getRateLimitMultiplier(teamId, orgId);
-  return getAutumnRateLimiter(mode, multiplier);
+  const multiplier =
+    getRateLimitOverride(mode, flags?.rateLimitOverrides) !== undefined
+      ? 1
+      : await autumnService.getRateLimitMultiplier(teamId, orgId);
+  return getAutumnRateLimiter(mode, multiplier, flags);
 }
 
 async function supaAuthenticateUser(
@@ -658,6 +687,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   } else if (token.startsWith("fco_")) {
     // OAuth access token — resolve via introspection endpoint
@@ -726,6 +756,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   } else {
     normalizedApi = parseApi(token);
@@ -756,6 +787,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   }
 

@@ -1,4 +1,5 @@
 import express, { Request, Response } from "express";
+import { externalRequestId } from "../../lib/external-request-id";
 import { z } from "zod";
 import { v7 as uuidv7 } from "uuid";
 import { logger as rootLogger } from "../../lib/logger";
@@ -15,13 +16,19 @@ import type {
   ResearchTableName,
 } from "../../services/logging/log_job";
 import type { RequestWithAuth } from "../v1/types";
-import type { TeamFlags } from "./types";
 import { wrap } from "../../routes/shared";
 import { integrationSchema } from "../../utils/integration";
 import { requestOrigin } from "../../lib/request-origin";
 
 const SEARCH_CREDITS_PER_TEN_RESULTS = 2;
 const ZDR_SEARCH_CREDITS_PER_TEN_RESULTS = 10;
+
+const DEVELOPER_SEARCH_TIMEOUT_MS = 15_000;
+const PAPER_SEARCH_TIMEOUT_MS = 30_000;
+const PAPER_INSPECT_TIMEOUT_MS = 5_000;
+const SIMILAR_PAPERS_TIMEOUT_MS = 10_000;
+const GITHUB_SEARCH_TIMEOUT_MS = 12_000;
+const PAPER_READ_TIMEOUT_MS = 120_000;
 
 const FORWARDED_REQUEST_HEADERS = ["accept", "x-request-id"];
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "x-request-id"];
@@ -109,6 +116,7 @@ const developerSearchSchema = z.strictObject({
   max_stars: starsSchema,
   archived: booleanFlag,
   fork: booleanFlag,
+  skills: z.enum(["only"]).optional(),
   ...commonQuery,
 });
 
@@ -126,6 +134,7 @@ const DEVELOPER_SEARCH_QUERY_KEYS = [
   "max_stars",
   "archived",
   "fork",
+  "skills",
 ];
 
 type ResearchEndpointConfig = {
@@ -140,13 +149,8 @@ type ResearchEndpointConfig = {
     params: Record<string, any>,
     req: RequestWithAuth<any, any, any>,
   ) => string;
+  timeoutMs?: number;
   billAs: "scrape" | "search";
-  /**
-   * Org flag that must be exactly `true` for this endpoint. Absent means
-   * ungated (the research endpoints). Keyless callers have no acuc and so no
-   * flags, which makes them unentitled by construction.
-   */
-  betaGate?: { flag: keyof NonNullable<TeamFlags>; error: string };
 };
 
 type ResearchController = (req: Request, res: Response) => Promise<any>;
@@ -206,6 +210,17 @@ function creditsFor(
   body: any,
   req: RequestWithAuth<any, any, any>,
 ) {
+  // Make certain research index accesses free (AI/ML & life-sciences indices).
+  // Research paper endpoints should have no credit cost. Explicit exceptions
+  // remain billable: GitHub search and developer/code search.
+  const freeResearchKinds = new Set([
+    "research_paper_search",
+    "research_related_papers",
+    "research_paper_read",
+    "research_paper_inspect",
+  ]);
+  if (freeResearchKinds.has(config.kind)) return 0;
+
   if (config.billAs === "scrape") return 1;
   const forcedKind = getSearchForcedKind(req.acuc?.flags);
   const perTen =
@@ -228,11 +243,22 @@ function researchError(
   });
 }
 
+function isResearchTimeoutError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "TimeoutError") ||
+    (error instanceof Error &&
+      (error.name === "ConnectTimeoutError" ||
+        (error.cause instanceof Error &&
+          error.cause.name === "ConnectTimeoutError")))
+  );
+}
+
 async function fetchForRequest(
   req: RequestWithAuth<any, any, any>,
   path: string,
   params: Record<string, unknown>,
   queryKeys: string[],
+  timeoutMs?: number,
 ) {
   const headers: Record<string, string> = {};
   for (const h of FORWARDED_REQUEST_HEADERS) {
@@ -241,7 +267,13 @@ async function fetchForRequest(
   }
   headers["firecrawl-team-id"] = req.auth.team_id;
 
-  return fetchResearchUpstream({ path, params, queryKeys, headers });
+  return fetchResearchUpstream({
+    path,
+    params,
+    queryKeys,
+    headers,
+    timeoutMs,
+  });
 }
 
 function createResearchController(
@@ -252,14 +284,8 @@ function createResearchController(
 ): ResearchController {
   return async (req, res: Response) => {
     const authedReq = req as RequestWithAuth<any, any, any>;
-
-    // Beta gate: fail closed before any logging, billing, or upstream call.
-    if (
-      endpoint.betaGate &&
-      authedReq.acuc?.flags?.[endpoint.betaGate.flag] !== true
-    ) {
-      return researchError(res, 403, endpoint.betaGate.error);
-    }
+    const zeroDataRetention =
+      getSearchForcedKind(authedReq.acuc?.flags) !== null;
 
     const started = Date.now();
     const jobId = uuidv7();
@@ -274,6 +300,10 @@ function createResearchController(
     const parsed = schema.safeParse(source);
     if (!parsed.success) {
       logger.warn("Invalid research query", { error: parsed.error.issues });
+      // The outer finally below never runs for validation failures, but a
+      // malformed keyless request must still leave the canonical keyless/usage
+      // trail — ID-enumeration abuse produces plenty of 400s.
+      chargeKeylessCredits(authedReq.auth.team_id, 0).catch(() => {});
       return researchError(
         res,
         400,
@@ -288,11 +318,12 @@ function createResearchController(
       id: jobId,
       kind: endpoint.kind,
       api_version: "v2",
+      external_request_id: externalRequestId(authedReq),
       team_id: authedReq.auth.team_id,
       origin: requestOrigin(params, req),
       integration: params.integration ?? null,
       target_hint: targetHint,
-      zeroDataRetention: false,
+      zeroDataRetention,
       api_key_id: authedReq.acuc?.api_key_id ?? null,
     });
 
@@ -307,6 +338,7 @@ function createResearchController(
         endpoint.upstreamPath(params, authedReq),
         params,
         queryKeys,
+        endpoint.timeoutMs,
       );
       if (!upstream) {
         statusCode = 404;
@@ -337,6 +369,7 @@ function createResearchController(
             {
               endpoint: endpoint.billAs === "scrape" ? "scrape" : "search",
               jobId,
+              chargeId: jobId,
             },
           ).catch(billingError => {
             logger.error("Failed to bill research request", {
@@ -344,7 +377,6 @@ function createResearchController(
               credits,
             });
           });
-          chargeKeylessCredits(authedReq.auth.team_id, credits).catch(() => {});
         }
       } else {
         error =
@@ -362,7 +394,7 @@ function createResearchController(
           : responseBody;
       return res.status(statusCode).json(response);
     } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === "TimeoutError") {
+      if (isResearchTimeoutError(err)) {
         statusCode = 504;
         error = "Research service timed out";
         return res.status(504).end();
@@ -373,6 +405,18 @@ function createResearchController(
       return res.status(502).end();
     } finally {
       const timeTaken = (Date.now() - started) / 1000;
+
+      // No-op for keyed teams. For keyless callers: billable credits are added
+      // to the per-IP daily budget and land as a `keyless_credit_usage` row;
+      // zero-credit outcomes emit the canonical `keyless/usage` log line
+      // instead (the durable zero-credit row waits on the firecrawl-db
+      // migration). It runs on every outcome, not just billable successes: the
+      // paper endpoints cost 0 credits and ID enumeration mostly produces
+      // upstream misses, so gating this on `credits > 0` left those requests
+      // with no IP recorded anywhere. `credits` is still 0 on every non-2xx
+      // path, so nothing extra is charged.
+      chargeKeylessCredits(authedReq.auth.team_id, credits).catch(() => {});
+
       logResearchEndpoint({
         table: endpoint.table,
         id: jobId,
@@ -386,7 +430,7 @@ function createResearchController(
         credits_cost: statusCode >= 200 && statusCode < 300 ? credits : 0,
         is_successful: statusCode >= 200 && statusCode < 300,
         error,
-        zeroDataRetention: false,
+        zeroDataRetention,
       }).catch(logError => {
         logger.warn("Research endpoint log failed", { error: logError });
       });
@@ -422,6 +466,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
           action: "searchPapers",
           targetHint: params => String(params.query),
           upstreamPath: () => "/v2/research/papers",
+          timeoutMs: PAPER_SEARCH_TIMEOUT_MS,
           billAs: "search",
         },
         options,
@@ -443,6 +488,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
             `${req.params.id}: ${String(params.intent)}`,
           upstreamPath: (_params, req) =>
             `/v2/research/papers/${encodeURIComponent(req.params.id)}/similar`,
+          timeoutMs: SIMILAR_PAPERS_TIMEOUT_MS,
           billAs: "search",
         },
         options,
@@ -466,6 +512,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
           targetHint: (_params, request) => request.params.id,
           upstreamPath: (_params, request) =>
             `/v2/research/papers/${encodeURIComponent(request.params.id)}`,
+          timeoutMs: isRead ? PAPER_READ_TIMEOUT_MS : PAPER_INSPECT_TIMEOUT_MS,
           billAs: "scrape",
         },
         options,
@@ -486,6 +533,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
           action: "searchGithub",
           targetHint: params => String(params.query),
           upstreamPath: () => "/v2/research/github",
+          timeoutMs: GITHUB_SEARCH_TIMEOUT_MS,
           billAs: "search",
         },
         options,
@@ -509,12 +557,8 @@ export function createDeveloperRouter(options: { root?: boolean } = {}) {
         action: "searchDeveloper",
         targetHint: params => String(params.query),
         upstreamPath: () => "/v2/code/search",
+        timeoutMs: DEVELOPER_SEARCH_TIMEOUT_MS,
         billAs: "search",
-        betaGate: {
-          flag: "developerBeta",
-          error:
-            "Developer search is in beta and is not enabled for this team.",
-        },
       },
     ),
   );
