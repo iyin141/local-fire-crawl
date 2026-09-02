@@ -217,6 +217,7 @@ const configSchema = z.object({
   SCRAPE_MAX_DOCUMENT_PREFETCHES: z.coerce.number().int().positive().default(2),
 
   // Search Services
+  SERPER_API_KEY: z.string().optional(),
   SEARXNG_ENDPOINT: z.string().optional(),
   SEARXNG_ENGINES: z.string().optional(),
   SEARXNG_CATEGORIES: z.string().optional(),

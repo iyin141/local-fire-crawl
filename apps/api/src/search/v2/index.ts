@@ -2,6 +2,7 @@ import { SearchV2Response, SearchResultType } from "../../lib/entities";
 import { config } from "../../config";
 import { fire_engine_search_v2 } from "./fireEngine-v2";
 import { searxng_search } from "./searxng";
+import { serper_search } from "./serper";
 import { ddgSearch } from "./ddgsearch";
 import { Logger } from "winston";
 
@@ -59,6 +60,18 @@ export async function search({
         num_results,
         tbs,
         filter,
+        lang,
+        country,
+        location,
+      });
+      if (results.web && results.web.length > 0) return results;
+    }
+
+    if (config.SERPER_API_KEY) {
+      logger.info("Using Serper search");
+      const results = await serper_search(query, {
+        num_results,
+        tbs,
         lang,
         country,
         location,
