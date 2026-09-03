@@ -65,7 +65,11 @@ export type Engine =
   | "wikipedia"
   | "x-twitter";
 
-const usePlaywright =
+// Exported so callers that pin forceEngine (sitemap fetching, which bypasses the
+// engine list below) can check a browser service is actually configured before
+// naming it -- forceEngine skips the availability filtering that would otherwise
+// have dropped it.
+export const usePlaywright =
   config.PLAYWRIGHT_MICROSERVICE_URL !== "" &&
   config.PLAYWRIGHT_MICROSERVICE_URL !== undefined;
 const useWikipedia =

@@ -6,7 +6,7 @@ import type { Logger } from "winston";
 import { CostTracking } from "../../lib/cost-tracking";
 import { ScrapeJobTimeoutError } from "../../lib/error";
 import type { ScrapeOptions } from "../../controllers/v2/types";
-import { Engine } from "../scrapeURL/engines";
+import { Engine, usePlaywright } from "../scrapeURL/engines";
 import { useFireEngine } from "../scrapeURL/engines/fire-engine/available";
 import {
   ParsedSitemap,
@@ -97,6 +97,15 @@ export async function getLinksFromSitemap(
                 "fire-engine;tlsclient;stealth" as const,
               ]
             : []),
+          // Last resort, and only when a browser service is actually configured.
+          // Sitemaps behind a bot wall answer a plain fetch with the challenge page
+          // rather than XML, and on a self-hosted deployment without fire-engine
+          // every entry above this line is a plain HTTP client -- so there was no
+          // way for a sitemap to be read at all once it was gated. buildFallbackList
+          // preserves forceEngine order verbatim (it skips its quality sort when
+          // forceEngine is set), so this stays strictly a fallback: `fetch` is still
+          // tried first and still answers for the overwhelming majority of sitemaps.
+          ...(usePlaywright ? ["playwright" as const] : []),
         ];
 
         const response = await scrapeURL(

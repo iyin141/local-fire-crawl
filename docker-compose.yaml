@@ -24,7 +24,10 @@ x-common-service: &common-service
 x-common-env: &common-env
   REDIS_URL: ${REDIS_URL:-redis://redis:6379}
   REDIS_RATE_LIMIT_URL: ${REDIS_RATE_LIMIT_URL:-${REDIS_URL:-redis://redis:6379}}
-  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000/scrape}
+  # Points at camoufox-service, which replaced playwright-service in this stack.
+  # The api-side engine is still named `playwright` and still speaks the same
+  # contract; only what answers on the other end changed.
+  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://camoufox-service:3000/scrape}
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
   POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
   POSTGRES_DB: ${POSTGRES_DB:-postgres}
@@ -61,43 +64,14 @@ x-common-env: &common-env
   FDB_CLUSTER_FILE: ${NUQ_BACKEND:+/var/fdb/fdb.cluster}
 
 services:
-  playwright-service:
-    # NOTE: If you don't want to build the service locally,
-    # comment out the build: statement and uncomment the image: statement
-    # image: ghcr.io/firecrawl/playwright-service:latest
-    build: apps/playwright-service-ts
-    environment:
-      PORT: 3000
-      PROXY_SERVER: ${PROXY_SERVER}
-      PROXY_USERNAME: ${PROXY_USERNAME}
-      PROXY_PASSWORD: ${PROXY_PASSWORD}
-      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS}
-      BLOCK_MEDIA: ${BLOCK_MEDIA}
-      # Configure maximum concurrent pages for Playwright browser instances
-      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
-    networks:
-      - backend
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    # Resource limits for Docker Compose (not Swarm)
-    cpus: 2.0
-    mem_limit: 4G
-    memswap_limit: 4G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-        compress: "true"
-    tmpfs:
-      - /tmp/.cache:noexec,nosuid,size=1g
-
-  # Camoufox-driven alternative to playwright-service, kept as a separate
-  # service (own port, not wired into PLAYWRIGHT_MICROSERVICE_URL) so it can
-  # be tested side by side before anything cuts over. Same request/response
-  # contract as playwright-service; see apps/camoufox-service-ts.
+  # The browser-rendering service, replacing the Chromium-based
+  # playwright-service that used to occupy this slot. Same request/response
+  # contract (so PLAYWRIGHT_MICROSERVICE_URL and the api's `playwright` engine
+  # keep working untouched -- only the URL default above changed), but driven by
+  # Camoufox with trawl's tiered challenge escalation. See
+  # apps/camoufox-service-ts. Named for what it is rather than the engine slot
+  # it fills; the api-side engine is still called `playwright` because renaming
+  # it would ripple through engines/index.ts, its types and its tests.
   camoufox-service:
     build:
       context: apps/camoufox-service-ts
@@ -111,7 +85,8 @@ services:
       secrets:
         - github_token
     environment:
-      PORT: 3010
+      # 3000 to match PLAYWRIGHT_MICROSERVICE_URL's default, which the api uses.
+      PORT: 3000
       # PROXY_SERVER is the SSRF-guard proxy's own upstream (see api.ts's
       # buildUpstreamProxyUrl) -- unrelated to the two below, which are trawl's
       # Tier 3/4 escalation pools.
@@ -126,8 +101,12 @@ services:
       # that doesn't collide with any of Firecrawl's own key namespaces (checked
       # against apps/api/src before this was wired in).
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS}
-      BROWSER_POOL_SIZE: ${CAMOUFOX_BROWSER_POOL_SIZE}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-3600}
+      # Named apart from the api's own BROWSER_POOL_SIZE, which means something
+      # different (its scrape concurrency, not a count of live browsers). Each
+      # Camoufox instance is a real Firefox, so this is the memory dial for the
+      # service -- 3 is trawl's own default.
+      BROWSER_POOL_SIZE: ${CAMOUFOX_BROWSER_POOL_SIZE:-3}
       # Tier 3/4 datacenter/residential proxy escalation pools (trawl/tiers).
       # Comma-separated URL lists (or *_LIST_FILE, one per line) -- both optional;
       # unset means those tiers simply have no pool proxy to escalate through and
@@ -139,8 +118,9 @@ services:
       RESIDENTIAL_PROXY_LIST_FILE: ${RESIDENTIAL_PROXY_LIST_FILE}
     depends_on:
       - redis
-    ports:
-      - "3010:3010"
+    # No host port published: like the playwright-service it replaces, this is
+    # reached only by the api over the backend network. Publish one temporarily
+    # if you need to curl /scrape directly while debugging.
     networks:
       - backend
     security_opt:
@@ -173,7 +153,7 @@ services:
     depends_on:
       redis:
         condition: service_started
-      playwright-service:
+      camoufox-service:
         condition: service_started
       rabbitmq:
         condition: service_healthy
