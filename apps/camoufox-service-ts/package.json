@@ -1,0 +1,33 @@
+{
+  "name": "camoufox-scraper-api",
+  "version": "1.0.0",
+  "description": "browser rendering service, speaking playwright-service's contract, driven by Camoufox + trawl's tiered challenge-escalation logic (vendored under trawl/, see that directory's file comments)",
+  "main": "api.ts",
+  "scripts": {
+    "start": "node dist/api.js",
+    "build": "tsc",
+    "dev": "tsx api.ts"
+  },
+  "keywords": [],
+  "license": "ISC",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "camoufox-js": "0.12.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "ioredis": "^5.4.1",
+    "ipaddr.js": "^2.3.0",
+    "playwright-core": "^1.58.1",
+    "proxy-chain": "^2.7.1",
+    "undici": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.15.30",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@11.4.0"
+}

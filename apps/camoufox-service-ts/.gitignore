@@ -1,0 +1,11 @@
+dist/
+node_modules/
+
+# The extracted Camoufox browser (~1.2GB) the Dockerfile COPYs into the image.
+# Deliberately not in git: it is a build input fetched from a GitHub release,
+# not source. camoufox-js can fetch it itself at build time -- this directory
+# only exists because that download has no resume support and kept failing
+# mid-transfer on an unstable connection. See the Dockerfile comment above the
+# COPY for how to regenerate it (fetch the release zip, extract here, write
+# version.json).
+.camoufox-prefetched/

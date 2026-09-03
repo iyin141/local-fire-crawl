@@ -94,6 +94,71 @@ services:
     tmpfs:
       - /tmp/.cache:noexec,nosuid,size=1g
 
+  # Camoufox-driven alternative to playwright-service, kept as a separate
+  # service (own port, not wired into PLAYWRIGHT_MICROSERVICE_URL) so it can
+  # be tested side by side before anything cuts over. Same request/response
+  # contract as playwright-service; see apps/camoufox-service-ts.
+  camoufox-service:
+    build:
+      context: apps/camoufox-service-ts
+      # camoufox-js's build-time `fetch` step calls GitHub's API twice
+      # (browser binary + GeoIP database) and unauthenticated calls hit
+      # GitHub's secondary rate limit after a handful of rebuilds. Sourced
+      # from an env var, not committed anywhere -- compose secrets keep it
+      # out of image layers and `docker history`, same as the manual
+      # `docker build --secret` used during development. Optional: an unset
+      # GITHUB_TOKEN just means slower/riskier (but still working) fetches.
+      secrets:
+        - github_token
+    environment:
+      PORT: 3010
+      # PROXY_SERVER is the SSRF-guard proxy's own upstream (see api.ts's
+      # buildUpstreamProxyUrl) -- unrelated to the two below, which are trawl's
+      # Tier 3/4 escalation pools.
+      PROXY_SERVER: ${PROXY_SERVER}
+      PROXY_USERNAME: ${PROXY_USERNAME}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS}
+      BLOCK_MEDIA: ${BLOCK_MEDIA}
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
+      # Shares Firecrawl's existing redis service rather than standing up a second
+      # instance -- trawl's session cache uses a distinct `session:*` key prefix
+      # that doesn't collide with any of Firecrawl's own key namespaces (checked
+      # against apps/api/src before this was wired in).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS}
+      BROWSER_POOL_SIZE: ${CAMOUFOX_BROWSER_POOL_SIZE}
+      # Tier 3/4 datacenter/residential proxy escalation pools (trawl/tiers).
+      # Comma-separated URL lists (or *_LIST_FILE, one per line) -- both optional;
+      # unset means those tiers simply have no pool proxy to escalate through and
+      # fall back to the default SSRF-guard-proxied browser context instead of
+      # failing outright.
+      PROXY_URL: ${TIER3_PROXY_URL}
+      PROXY_LIST_FILE: ${TIER3_PROXY_LIST_FILE}
+      RESIDENTIAL_PROXY_URL: ${RESIDENTIAL_PROXY_URL}
+      RESIDENTIAL_PROXY_LIST_FILE: ${RESIDENTIAL_PROXY_LIST_FILE}
+    depends_on:
+      - redis
+    ports:
+      - "3010:3010"
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: 2.0
+    mem_limit: 4G
+    memswap_limit: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+
   api:
     <<: *common-service
     environment:
@@ -218,3 +283,11 @@ networks:
 volumes:
   fdb-data:
   fdb-cluster-file:
+
+secrets:
+  # Optional -- an unset GITHUB_TOKEN just means camoufox-service's build
+  # makes unauthenticated GitHub API calls (still works, just closer to
+  # rate limits on repeated builds). See camoufox-service's build.secrets
+  # comment above.
+  github_token:
+    environment: GITHUB_TOKEN

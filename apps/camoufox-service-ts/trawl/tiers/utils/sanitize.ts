@@ -1,0 +1,164 @@
+export const RESERVED_HEADER_NAMES: ReadonlySet<string> = new Set([
+  "host",
+  "cookie",
+  "authorization",
+  "proxy-authorization",
+  "user-agent",
+  "content-length",
+  "connection",
+  "transfer-encoding",
+  "upgrade",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-real-ip",
+  "cf-connecting-ip",
+  "cf-ipcountry",
+  "cf-ray",
+  "cf-worker",
+  "cf-cache-status",
+  "sec-fetch-dest",
+  "sec-fetch-mode",
+  "sec-fetch-site",
+  "sec-fetch-user",
+  "sec-ch-ua",
+  "sec-ch-ua-mobile",
+  "sec-ch-ua-platform",
+])
+
+export function sanitizeHeaders(headers?: Record<string, string>): Record<string, string> | undefined {
+  if (!headers) return
+  const out: Record<string, string> = {}
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = rawName.trim()
+    if (!name || RESERVED_HEADER_NAMES.has(name.toLowerCase())) continue
+    const value = String(rawValue ?? "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: NUL/CR/LF are exactly what we want to strip from header values
+      .replace(/[\x00\r\n]/g, "")
+      .trim()
+    if (value) out[name] = value
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+// Hop-by-hop headers per RFC 7230 §6.1 — connection-scoped, not forwarded end-to-end.
+// These are the only headers a transparent HTTP proxy should strip from a client's
+// request. Everything else (Authorization, Cookie, Range, custom API keys, etc.) is
+// passed through. The key difference from `sanitizeHeaders()`: that function is the
+// security boundary for the public /scrape API; this one is for trusted internal
+// clients of the MITM proxy at :8192.
+const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection", // legacy but still seen
+  "te",
+  "trailer", // hop-by-hop per spec
+  "transfer-encoding",
+  "upgrade",
+])
+
+/**
+ * Permissive header sanitizer for the MITM proxy at :8192.
+ *
+ * Strips only RFC 7230 hop-by-hop headers (Connection, Transfer-Encoding, Upgrade,
+ * Keep-Alive, Proxy-*, TE, Trailer). Everything else — including Authorization,
+ * Cookie, Range, User-Agent, Referer, custom API tokens — flows through to the
+ * upstream as the client sent it. Header values are still sanitized for control
+ * characters (NUL/CR/LF) to prevent request smuggling.
+ *
+ * Returned keys are lowercased so the proxy can match them cheaply against
+ * lookup tables when forwarding.
+ */
+export function proxySanitizeHeaders(headers?: Record<string, string>): Record<string, string> | undefined {
+  if (!headers) return
+  const out: Record<string, string> = {}
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = rawName.trim()
+    if (!name) continue
+    if (HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue
+    const value = String(rawValue ?? "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: NUL/CR/LF are exactly what we want to strip from header values
+      .replace(/[\x00\r\n]/g, "")
+      .trim()
+    if (!value) continue
+    out[name.toLowerCase()] = value
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+// Hop-by-hop response headers — also per RFC 7230 §6.1. Forwarded response
+// headers from upstream should have these stripped before they reach the client.
+export const RESPONSE_HOP_BY_HOP_HEADERS: ReadonlySet<string> = HOP_BY_HOP_HEADERS
+
+import type { SupportedMethod } from "../../types"
+
+// SupportedMethod now lives in @trawl/types (single source of truth, shared with
+// ScrapeRequest.method); re-exported here for backward compat.
+export type { SupportedMethod } from "../../types"
+
+export const SUPPORTED_METHODS: readonly SupportedMethod[] = [
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
+  "TRACE",
+  // RFC 9341 — safe verb that carries the query in the request body.
+  "QUERY",
+]
+
+const SUPPORTED_METHOD_SET: ReadonlySet<string> = new Set(SUPPORTED_METHODS)
+
+export function isValidMethod(method: unknown): method is SupportedMethod {
+  if (method === undefined) return true
+  return typeof method === "string" && SUPPORTED_METHOD_SET.has(method)
+}
+
+export class RequestValidationError extends Error {
+  readonly statusCode: number
+  constructor(message: string, statusCode: number) {
+    super(message)
+    this.name = "RequestValidationError"
+    this.statusCode = statusCode
+  }
+}
+
+export function requireContentTypeForBody(headers: Record<string, string> | undefined, hasBody: boolean): void {
+  if (!hasBody) return
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (k.toLowerCase() === "content-type" && v?.trim()) return
+  }
+  throw new RequestValidationError("body requires a Content-Type header to be set", 400)
+}
+
+/** Minimal contract a Playwright `Route` exposes to `routeContinueOverrides`. */
+export interface RouteLike {
+  request(): { headers(): Record<string, string>; method(): string }
+  continue(overrides: object): Promise<void>
+}
+
+/**
+ * Build the `route.continue(...)` overrides for a tier 2/3/4 navigation,
+ * applying caller-supplied headers + a POST rewrite when the upstream loaded
+ * with GET. Content-Type is the caller's responsibility — see
+ * `requireContentTypeForBody`.
+ *
+ * The `postData` key in the returned object is Playwright's literal
+ * `Route.continue()` API field name — it is NOT TRAWL's `body` field. Playwright
+ * has not renamed it; we can't either without breaking the contract.
+ */
+export function routeContinueOverrides(
+  route: RouteLike,
+  extraHeaders: Record<string, string> | undefined,
+  method: string | undefined,
+  body: string | undefined,
+): { headers: Record<string, string>; method?: string; postData?: string } {
+  const req = route.request()
+  const headers = { ...req.headers(), ...extraHeaders }
+  return method === "POST" && req.method() === "GET" ? { headers, method: "POST", postData: body } : { headers }
+}

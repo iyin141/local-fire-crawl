@@ -1,0 +1,5 @@
+export { FINGERPRINT, FINGERPRINT_POOL } from "./fingerprint"
+export type { BrowserHandle } from "./pool"
+export { BrowserPool, closeTemporaryContext, newFreshContext, PoolExhaustedError, setDefaultEgressProxy } from "./pool"
+export { type PlaywrightProxy, toPlaywrightProxy } from "./proxy"
+export { SessionCache } from "./session"
