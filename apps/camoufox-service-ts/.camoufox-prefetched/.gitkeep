@@ -1,0 +1,10 @@
+Keeps this directory present in a fresh clone.
+
+The Dockerfile COPYs this directory unconditionally and Docker's COPY fails on a
+missing source, so the directory has to exist even when empty. Empty is a
+perfectly good state: camoufox-js downloads the browser during the build when it
+finds no matching version.json here.
+
+Run scripts/prefetch-camoufox.sh to populate it. That only makes the build faster
+(and survives a connection that can't hold a 663MB transfer); it is never
+required for a correct build.

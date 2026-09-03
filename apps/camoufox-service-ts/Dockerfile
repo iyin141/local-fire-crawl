@@ -64,22 +64,18 @@ ENV CAMOUFOX_INSTALL_DIR=/usr/src/app/.camoufox
 # fragile to rely on over an unstable connection -- camoufox-js's own
 # downloader has no resume support, so any mid-transfer drop loses the whole
 # attempt and the whole ~10min+ RUN layer with it (repeatedly, during
-# development). .camoufox-prefetched/ is that same release
-# (camoufox-152.0.4-beta.29-lin.x86_64.zip, extracted, plus the version.json
-# CamoufoxFetcher.setVersion() would itself have written) fetched separately
-# with `curl -C -` (resumable, unlike camoufox-js's fetch) and committed into
-# the build context. Placing it at CAMOUFOX_INSTALL_DIR before `fetch` runs
-# means CamoufoxUpdate.isUpdateNeeded() (pkgman.js) finds a version.json that
-# already matches latest and skips the download outright -- `fetch` still
-# runs, but only to confirm that and pull the small (~65MB) GeoIP database,
-# which never had this problem.
+# development). scripts/prefetch-camoufox.sh stages that same release here
+# using `curl -C -`, which resumes instead of restarting.
 #
-# To refresh this later (a new Camoufox release lands): fetch the new
-# release's linux x86_64 zip, extract it into .camoufox-prefetched/, and
-# update the version.json inside it to match -- see pkgman.js's Version
-# class for the exact release/version split (it's the two dash-separated
-# groups after "camoufox-" and before "-lin.x86_64.zip", e.g.
-# "152.0.4-beta.29" -> version="152.0.4", release="beta.29").
+# OPTIONAL, and empty is a valid state. When this holds a version.json matching
+# the latest release, CamoufoxUpdate.isUpdateNeeded() (pkgman.js) skips the
+# download outright and `fetch` below only confirms that and pulls the small
+# (~65MB) GeoIP database, which never had this problem. When it holds just the
+# .gitkeep -- as in any fresh clone, since the browser itself is far too large
+# for git -- `fetch` downloads the browser as it normally would and the build
+# is merely slower. The directory is committed (empty) rather than ignored
+# outright because COPY fails on a missing source, which would make a fresh
+# clone unbuildable instead of just slow.
 COPY .camoufox-prefetched/ ${CAMOUFOX_INSTALL_DIR}/
 
 # `fetch` also unconditionally pulls a GeoIP database from a *second*,

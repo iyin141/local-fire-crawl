@@ -2,10 +2,14 @@ dist/
 node_modules/
 
 # The extracted Camoufox browser (~1.2GB) the Dockerfile COPYs into the image.
-# Deliberately not in git: it is a build input fetched from a GitHub release,
-# not source. camoufox-js can fetch it itself at build time -- this directory
-# only exists because that download has no resume support and kept failing
-# mid-transfer on an unstable connection. See the Dockerfile comment above the
-# COPY for how to regenerate it (fetch the release zip, extract here, write
-# version.json).
-.camoufox-prefetched/
+# Its *contents* are deliberately not in git: they are a build input fetched from
+# a GitHub release, not source.
+#
+# The directory itself is kept (via .gitkeep) because the Dockerfile COPYs it
+# unconditionally, and COPY fails outright on a missing directory -- so ignoring
+# the whole thing made a fresh clone unbuildable rather than merely slower. Empty
+# is fine: camoufox-js downloads the browser itself when it finds no matching
+# version.json. Populating it (scripts/prefetch-camoufox.sh) only makes the build
+# faster and survives a flaky connection; it is never required.
+.camoufox-prefetched/*
+!.camoufox-prefetched/.gitkeep
