@@ -49,7 +49,14 @@ WORKDIR /usr/src/app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
-COPY . .
+# Everything from here to `pnpm run build` is deliberately ordered so that the
+# browser fetch sits ABOVE the source copy. Docker invalidates every layer after
+# the first one that changes, so with `COPY . .` above the fetch (as it was
+# originally) editing a single .ts file re-ran the fetch -- which even with the
+# prefetch populated still re-downloads the ~65MB GeoIP database on every code
+# change, and on a bad connection can fail the build outright. The fetch depends
+# only on node_modules and CAMOUFOX_INSTALL_DIR, never on this service's source,
+# so it belongs before it.
 
 # camoufox-js defaults to caching the browser download under the *running
 # user's* home directory (os.homedir()/.cache/camoufox). This fetch step runs
@@ -98,6 +105,17 @@ COPY .camoufox-prefetched/ ${CAMOUFOX_INSTALL_DIR}/
 # image.
 RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
     pnpm exec camoufox-js fetch
+
+# Source last, and listed explicitly rather than `COPY . .`. A blanket copy also
+# pulled .camoufox-prefetched/ into the image a second time (1.2GB of it), on top
+# of the copy the line above had already placed at CAMOUFOX_INSTALL_DIR -- nothing
+# reads that duplicate, and it cannot be reclaimed by deleting it later because
+# the bytes are already committed to a lower layer. Listing sources also means a
+# new top-level file has to be added here consciously rather than silently
+# inflating the image.
+COPY api.ts trawl-deps.ts tsconfig.json ./
+COPY helpers/ ./helpers/
+COPY trawl/ ./trawl/
 
 RUN pnpm run build
 
