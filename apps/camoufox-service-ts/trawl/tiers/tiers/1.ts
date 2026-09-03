@@ -41,6 +41,9 @@ export async function runTier1(
   method?: string,
   body?: string,
   proxy?: string,
+  // waitAfterLoad is deliberately absent: this tier never executes JS, so there is
+  // nothing for a post-load wait to accomplish here.
+  opts?: { skipTlsVerification?: boolean },
 ): Promise<Tier1Result> {
   const start = Date.now()
   try {
@@ -66,7 +69,7 @@ export async function runTier1(
         ...extraHeaders,
       },
       redirect: "follow",
-      dispatcher: getFetchDispatcher(proxy),
+      dispatcher: getFetchDispatcher(proxy, opts?.skipTlsVerification),
     }
     const res = await fetch(url, fetchOptions as RequestInit)
 

@@ -78,6 +78,12 @@ export async function scrape(
   const sanitizedHeaders = sanitizeHeaders(req.headers)
   requireContentTypeForBody(sanitizedHeaders, Boolean(req.body))
 
+  // Carried into every tier that can act on them.
+  const tierOpts = {
+    skipTlsVerification: req.skipTlsVerification,
+    waitAfterLoad: req.waitAfterLoad,
+  }
+
   const emit = (r: TierResult & { challenge?: unknown }) => {
     const { challenge: _challenge, ...publicResult } = r
     timings.push(publicResult)
@@ -90,7 +96,7 @@ export async function scrape(
 
   // Tier 1: plain HTTP fetch
   if (!req.skipHttp && !skipTier1ForProxy && maxTier >= 1) {
-    const t1 = await runTier1(req.url, sanitizedHeaders, req.method, req.body, tier1Proxy)
+    const t1 = await runTier1(req.url, sanitizedHeaders, req.method, req.body, tier1Proxy, tierOpts)
     emit(t1)
     if (explicitProxy && t1.status === "error" && t1.reason?.startsWith("proxy-")) {
       throw new ScrapeError(t1.reason, timings)
@@ -139,10 +145,23 @@ export async function scrape(
   try {
     // Tier 2: browser with cached session
     const session = explicitProxy ? undefined : await deps.loadSession(domain)
-    if (session && maxTier >= 2) {
+    // Tier 2 runs on the pool's shared context, whose TLS behaviour is fixed at
+    // creation, so it cannot honour a per-request skipTlsVerification. Skipping
+    // straight to Tier 3 (which builds a fresh context per request) is the only
+    // way to actually respect the flag rather than silently dropping it.
+    if (session && maxTier >= 2 && !req.skipTlsVerification) {
       const remaining = maxTimeout - (Date.now() - totalStart)
       const tier2Runner = runners.tier2 ?? runTier2
-      let t2 = await tier2Runner(req.url, handle, session, remaining, sanitizedHeaders, req.method, req.body)
+      let t2 = await tier2Runner(
+        req.url,
+        handle,
+        session,
+        remaining,
+        sanitizedHeaders,
+        req.method,
+        req.body,
+        tierOpts,
+      )
       if (t2.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
         t2 = await tier2Runner(
@@ -153,6 +172,7 @@ export async function scrape(
           sanitizedHeaders,
           req.method,
           req.body,
+          tierOpts,
         )
       }
       emit(t2)
@@ -199,7 +219,7 @@ export async function scrape(
     for (let attempt = 0; ; attempt++) {
       const remaining3 = maxTimeout - (Date.now() - totalStart)
       const tier3Runner = runners.tier3 ?? runTier3
-      t3 = await tier3Runner(req.url, handle, remaining3, proxy3, sanitizedHeaders, req.method, req.body)
+      t3 = await tier3Runner(req.url, handle, remaining3, proxy3, sanitizedHeaders, req.method, req.body, tierOpts)
       if (t3.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
         t3 = await tier3Runner(
@@ -210,6 +230,7 @@ export async function scrape(
           sanitizedHeaders,
           req.method,
           req.body,
+          tierOpts,
         )
       }
 
@@ -270,7 +291,7 @@ export async function scrape(
     for (let attempt = 0; ; attempt++) {
       console.log(`[orchestrator] Tier 4 via residential proxy: ${proxy4.replace(/\/\/[^@]*@/, "//**@")}`)
       const remaining4 = maxTimeout - (Date.now() - totalStart)
-      t4 = await runTier4Lazy(req.url, handle, remaining4, proxy4, sanitizedHeaders, req.method, req.body)
+      t4 = await runTier4Lazy(req.url, handle, remaining4, proxy4, sanitizedHeaders, req.method, req.body, tierOpts)
       if (t4.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
         t4 = await runTier4Lazy(
@@ -281,6 +302,7 @@ export async function scrape(
           sanitizedHeaders,
           req.method,
           req.body,
+          tierOpts,
         )
       }
 

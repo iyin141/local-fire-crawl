@@ -27,6 +27,18 @@ export interface ScrapeRequest {
   body?: string
   // Strict per-request route: target traffic must use this proxy and never fall back direct.
   proxy?: string
+  // Both of the below are additions to trawl's own request shape, needed because
+  // Firecrawl's playwright engine (apps/api/src/scraper/scrapeURL/engines/playwright)
+  // sends their equivalents on every single scrape. Dropping them would not be an
+  // edge case, it would silently change the behaviour of every request that arrives.
+  //
+  // Honoured by the browser tiers only. Tier 2 reuses the pool's shared context, whose
+  // TLS behaviour is fixed at creation and cannot be varied per request, so the
+  // orchestrator skips Tier 2 entirely when this is set rather than quietly ignoring it.
+  skipTlsVerification?: boolean
+  // Milliseconds to idle after load before reading content, for pages that finish
+  // rendering client-side. Meaningless to Tier 1, which never executes JS.
+  waitAfterLoad?: number
 }
 
 export interface TierResult {

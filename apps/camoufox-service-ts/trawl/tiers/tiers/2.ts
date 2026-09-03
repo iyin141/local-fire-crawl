@@ -36,6 +36,10 @@ export async function runTier2(
   extraHeaders?: Record<string, string>,
   method?: string,
   body?: string,
+  // No skipTlsVerification here: this tier runs on the pool's shared context, whose
+  // TLS behaviour is fixed at creation. The orchestrator skips Tier 2 altogether when
+  // a request asks for it, rather than accepting the flag and ignoring it.
+  opts?: { waitAfterLoad?: number },
 ): Promise<Tier2Result> {
   const start = Date.now()
   const activeContext = handle.context
@@ -117,6 +121,12 @@ export async function runTier2(
     if (solveRemaining > 5000) {
       const result = await solvePageCaptchas(page, solveRemaining).catch(() => ({ attempted: [], solved: [] }))
       captchasSolved = result.solved
+    }
+
+    // See Tier 3: idle for client-side rendering, bounded by the caller's budget.
+    if (opts?.waitAfterLoad && opts.waitAfterLoad > 0) {
+      const waitRemaining = Math.max(0, Math.min(opts.waitAfterLoad, maxTimeout - (Date.now() - start)))
+      if (waitRemaining > 0) await new Promise((r) => setTimeout(r, waitRemaining))
     }
 
     const finalHtml = await page.content()

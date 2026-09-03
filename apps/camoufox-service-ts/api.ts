@@ -136,6 +136,34 @@ interface UrlModel {
   skip_tls_verification?: boolean;
 }
 
+const countScriptTags = (html: string): number =>
+  (html.match(/<script\b/gi) ?? []).length;
+
+// Recognises the "client-rendered page that hasn't rendered yet" shape: almost no
+// visible text, but scripts present to produce it. Deliberately conservative --
+// this only decides whether to spend a second attempt through the browser tiers,
+// and a false positive costs one extra scrape while a false negative silently
+// returns an empty page. Thresholds are set so a genuinely small-but-real page
+// (a short article, a 404 with a sentence of text) stays above them.
+const SHELL_MAX_VISIBLE_TEXT = 200;
+
+const looksLikeUnrenderedShell = (html: string): boolean => {
+  if (!html) return false;
+  // A page with no scripts cannot be waiting on JS to render.
+  if (countScriptTags(html) === 0) return false;
+
+  const visibleText = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return visibleText.length < SHELL_MAX_VISIBLE_TEXT;
+};
+
 let poolReady = false;
 
 app.get('/health', async (_req: Request, res: Response) => {
@@ -159,19 +187,17 @@ app.post('/scrape', async (req: Request, res: Response) => {
   console.log(`URL: ${url}`);
   console.log(`Timeout: ${timeout}`);
   console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
-  // wait_after_load, check_selector, and skip_tls_verification are accepted for
-  // request-shape compatibility with the old playwright-service/camoufox-only
-  // contract, but are NOT implemented against trawl's orchestrator -- its
-  // ScrapeRequest type has no equivalent fields, and threading them through
-  // (into orchestrator.ts -> tiers 2-4 -> pool.ts's context creation) touches
-  // vendored package internals across three files for what was, until now, a
-  // narrow need (skip_tls_verification specifically mattered for CHELLARAM's
-  // broken cert chain during validation). Logged loudly rather than silently
-  // dropped so a caller relying on them notices in the logs, not just in
-  // unexpectedly-unmet expectations.
-  if (wait_after_load || check_selector || skip_tls_verification) {
+  console.log(`Wait After Load: ${wait_after_load ?? 0}`);
+  console.log(`Skip TLS Verification: ${skip_tls_verification ?? false}`);
+  // check_selector is the one field of the old contract still unimplemented.
+  // Firecrawl's own playwright engine never sends it (see
+  // apps/api/src/scraper/scrapeURL/engines/playwright/index.ts, which sends only
+  // url/wait_after_load/timeout/headers/skip_tls_verification), so nothing in
+  // this deployment relies on it -- but warn rather than drop it silently in case
+  // some other caller does.
+  if (check_selector) {
     console.warn(
-      `⚠️  wait_after_load/check_selector/skip_tls_verification were requested but are not supported via the trawl-orchestrated path -- ignored. (wait_after_load=${wait_after_load}, check_selector=${check_selector}, skip_tls_verification=${skip_tls_verification})`,
+      `⚠️  check_selector was requested but is not implemented on this service -- ignored. (check_selector=${check_selector})`,
     );
   }
   console.log(`==================================================`);
@@ -216,10 +242,36 @@ app.post('/scrape', async (req: Request, res: Response) => {
     // redirect hop) specific to this service's own hand-rolled context setup,
     // and trawl's tiers don't carry an equivalent. Known gap, not yet ported.
     headers,
+    skipTlsVerification: skip_tls_verification,
+    waitAfterLoad: wait_after_load,
   };
 
   try {
-    const result = await scrape(scrapeReq, getTrawlDeps());
+    let result = await scrape(scrapeReq, getTrawlDeps());
+
+    // Tier 1 is a plain fetch: it reports success for any 200 carrying markup,
+    // including a client-rendered shell whose real content only exists after JS
+    // runs. trawl escalates past anti-bot *challenges*, not past "this page needs
+    // a browser to render", so nothing below this layer will catch that -- a
+    // Vite/React SPA returns ~500 bytes of <div id="root"></div> and reads as a
+    // clean win. Retry those through the browser tiers, where the JS actually
+    // executes. Only ever costs a second attempt on pages that came back looking
+    // empty, and only when Tier 1 was the one that answered.
+    if (result.tier === 1 && looksLikeUnrenderedShell(result.html)) {
+      console.log(
+        `↻ Tier 1 returned what looks like an unrendered shell (${result.html.length}B, ${countScriptTags(result.html)} script tags) -- retrying via browser tiers`,
+      );
+      try {
+        result = await scrape({ ...scrapeReq, skipHttp: true }, getTrawlDeps());
+      } catch (retryError) {
+        // The shell was a valid 200. If the browser path can't do better, keep it
+        // rather than turning a thin success into a failure.
+        console.warn(
+          `↻ Browser-tier retry failed, keeping the Tier 1 shell: ${retryError instanceof Error ? retryError.message : retryError}`,
+        );
+      }
+    }
+
     const pageError =
       result.statusCode !== 200 ? getError(result.statusCode) : undefined;
 

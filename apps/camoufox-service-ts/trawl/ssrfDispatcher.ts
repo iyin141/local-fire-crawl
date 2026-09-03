@@ -16,13 +16,24 @@ export function setDefaultFetchProxy(proxyUrl: string): void {
 // passes one) always wins outright -- same "explicit beats default" rule pool.ts's
 // newFreshContext applies, and for the same reason: chaining our SSRF proxy in front of
 // a caller-supplied proxy isn't something most proxy providers support.
-export function getFetchDispatcher(explicitProxyUrl?: string): undici.Dispatcher | undefined {
+//
+// `insecure` mirrors the browser tiers' skipTlsVerification. It only ever relaxes
+// certificate checking; the proxy still validates the resolved IP of every connection,
+// so this cannot be used to reach an internal address.
+export function getFetchDispatcher(
+  explicitProxyUrl?: string,
+  insecure?: boolean,
+): undici.Dispatcher | undefined {
   const target = explicitProxyUrl ?? defaultProxyUrl
-  if (!target) return undefined
-  let dispatcher = dispatcherCache.get(target)
+  if (!target && !insecure) return undefined
+  const cacheKey = `${target ?? ""}|${insecure ? "insecure" : "secure"}`
+  let dispatcher = dispatcherCache.get(cacheKey)
   if (!dispatcher) {
-    dispatcher = new undici.ProxyAgent(target)
-    dispatcherCache.set(target, dispatcher)
+    const tls = insecure ? { rejectUnauthorized: false } : undefined
+    dispatcher = target
+      ? new undici.ProxyAgent({ uri: target, ...(tls ? { requestTls: tls } : {}) })
+      : new undici.Agent({ connect: tls })
+    dispatcherCache.set(cacheKey, dispatcher)
   }
   return dispatcher
 }

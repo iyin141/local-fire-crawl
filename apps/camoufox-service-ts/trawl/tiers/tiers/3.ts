@@ -59,6 +59,7 @@ export async function runTier3(
   extraHeaders?: Record<string, string>,
   method?: string,
   body?: string,
+  opts?: { skipTlsVerification?: boolean; waitAfterLoad?: number },
 ): Promise<Tier3Result> {
   const start = Date.now()
 
@@ -72,6 +73,7 @@ export async function runTier3(
   try {
     freshCtx = await newFreshContext(handle.browser, {
       proxy: proxyUrl,
+      ignoreHTTPSErrors: opts?.skipTlsVerification,
       onCreated: handle.noteTemporaryContext,
       requestReplacement: handle.requestBrowserReplacement,
     })
@@ -150,6 +152,14 @@ export async function runTier3(
     if (solveRemaining > 5000) {
       const solveResult = await solvePageCaptchas(page, solveRemaining).catch(() => ({ attempted: [], solved: [] }))
       captchasSolved = solveResult.solved
+    }
+
+    // Idle for client-side rendering, after any challenge is settled so the wait is
+    // spent on the real page rather than on an interstitial. Bounded by whatever is
+    // left of the caller's own budget.
+    if (opts?.waitAfterLoad && opts.waitAfterLoad > 0) {
+      const waitRemaining = Math.max(0, Math.min(opts.waitAfterLoad, maxTimeout - (Date.now() - start)))
+      if (waitRemaining > 0) await new Promise((r) => setTimeout(r, waitRemaining))
     }
 
     const html = await page.content()

@@ -734,7 +734,12 @@ type FreshBrowser = any
 type FreshContext = any
 export const newFreshContext = async (
   browser: FreshBrowser,
-  options?: { proxy?: string; onCreated?: () => void; requestReplacement?: (reason: string) => void },
+  options?: {
+    proxy?: string
+    ignoreHTTPSErrors?: boolean
+    onCreated?: () => void
+    requestReplacement?: (reason: string) => void
+  },
 ): Promise<FreshContext> => {
   // A Tier 3/4 caller passing its own datacenter/residential proxy is a deliberate
   // choice to exit through that specific IP -- chaining our SSRF guard proxy in front
@@ -745,6 +750,9 @@ export const newFreshContext = async (
   const context = await browser.newContext({
     viewport: null,
     ...(proxyUrl ? { proxy: toPlaywrightProxy(proxyUrl) } : {}),
+    // Only a temporary context can honour this -- the pooled context is shared
+    // across requests, so its TLS behaviour has to stay fixed.
+    ...(options?.ignoreHTTPSErrors ? { ignoreHTTPSErrors: true } : {}),
   })
   options?.onCreated?.()
   try {

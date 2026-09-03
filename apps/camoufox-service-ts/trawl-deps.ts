@@ -12,16 +12,30 @@ import { ProxyPool } from "./trawl/tiers"
 import type { SessionData } from "./trawl/types"
 import { setDefaultFetchProxy } from "./trawl/ssrfDispatcher"
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://redis:6379"
-const POOL_SIZE = Number(process.env.BROWSER_POOL_SIZE ?? "3")
-const ACQUIRE_TIMEOUT_MS = Number(process.env.BROWSER_ACQUIRE_TIMEOUT_MS ?? "15000")
-const SESSION_TTL = Number(process.env.SESSION_TTL_SECONDS ?? "3600")
-const RECYCLE_AFTER_TEMPORARY_CONTEXTS = Number(process.env.BROWSER_RECYCLE_AFTER_CONTEXTS ?? "8")
-const CONTENT_PROCESSES = Number(process.env.BROWSER_CONTENT_PROCESSES ?? "2")
-const HEADFUL_POOL_SIZE = Number(process.env.BROWSER_HEADFUL_POOL_SIZE ?? "0")
-const STALL_TIMEOUT_MS = Number(process.env.BROWSER_STALL_TIMEOUT_MS ?? "180000")
-const CLOSE_TIMEOUT_MS = Number(process.env.BROWSER_CLOSE_TIMEOUT_MS ?? "10000")
-const LAUNCH_TIMEOUT_MS = Number(process.env.BROWSER_LAUNCH_TIMEOUT_MS ?? "90000")
+const REDIS_URL =
+  process.env.REDIS_URL && process.env.REDIS_URL.trim() !== ""
+    ? process.env.REDIS_URL
+    : "redis://redis:6379"
+// docker-compose passes an *empty string* for an env var that is referenced but
+// unset, and `??` only catches null/undefined -- so a plain
+// `Number(process.env.X ?? "3")` silently yields 0 rather than the default. That is
+// how this service first came up reporting "all 0 browsers warm": a pool of zero,
+// which fails every browser tier at acquire() time rather than at startup.
+const numFromEnv = (value: string | undefined, fallback: number): number => {
+  if (value === undefined || value.trim() === "") return fallback
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const POOL_SIZE = numFromEnv(process.env.BROWSER_POOL_SIZE, 3)
+const ACQUIRE_TIMEOUT_MS = numFromEnv(process.env.BROWSER_ACQUIRE_TIMEOUT_MS, 15000)
+const SESSION_TTL = numFromEnv(process.env.SESSION_TTL_SECONDS, 3600)
+const RECYCLE_AFTER_TEMPORARY_CONTEXTS = numFromEnv(process.env.BROWSER_RECYCLE_AFTER_CONTEXTS, 8)
+const CONTENT_PROCESSES = numFromEnv(process.env.BROWSER_CONTENT_PROCESSES, 2)
+const HEADFUL_POOL_SIZE = numFromEnv(process.env.BROWSER_HEADFUL_POOL_SIZE, 0)
+const STALL_TIMEOUT_MS = numFromEnv(process.env.BROWSER_STALL_TIMEOUT_MS, 180000)
+const CLOSE_TIMEOUT_MS = numFromEnv(process.env.BROWSER_CLOSE_TIMEOUT_MS, 10000)
+const LAUNCH_TIMEOUT_MS = numFromEnv(process.env.BROWSER_LAUNCH_TIMEOUT_MS, 90000)
 
 // PROXY_URL / RESIDENTIAL_PROXY_URL: comma-separated list of proxy URLs (a single URL
 // still works, it's just a 1-element list). *_LIST_FILE is an alternative source (one
