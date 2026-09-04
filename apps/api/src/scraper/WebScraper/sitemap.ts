@@ -21,6 +21,37 @@ import { useIndex } from "../../services";
 
 const gunzipAsync = promisify(gunzip);
 
+// Markers a WAF interstitial carries. Kept in step with the same list on the
+// scraping service (camoufox-service-ts/shared/classify.ts) and in the mapping
+// service (services/mapping/shared_methods) -- three runtimes cannot share a
+// function, so they share the taxonomy instead.
+const CHALLENGE_MARKERS = [
+  "just a moment",
+  "checking your browser",
+  "cf-browser-verification",
+  "attention required",
+  "pardon our interruption",
+  "_incapsula_resource",
+  "incapsula incident id",
+  "access denied",
+  "request unsuccessful",
+];
+
+// True when a sitemap fetch came back with a bot wall instead of a sitemap.
+//
+// Both halves are needed. A marker alone is not enough: WAFs inject their scripts
+// and cookies into pages they serve perfectly well, so a real sitemap from a
+// protected site can carry one. And "not XML" alone is not enough either -- a plain
+// 404 page is also not XML, and treating that as a challenge would send every
+// conventional-path miss through a browser.
+function looksLikeChallengeNotSitemap(content: string): boolean {
+  if (!content) return false;
+  if (/<\s*(urlset|sitemapindex)\b/i.test(content)) return false;
+
+  const head = content.slice(0, 256 * 1024).toLowerCase();
+  return CHALLENGE_MARKERS.some(marker => head.includes(marker));
+}
+
 export async function getLinksFromSitemap(
   {
     sitemapUrl,
@@ -174,6 +205,63 @@ export async function getLinksFromSitemap(
           });
           return 0;
         }
+      }
+    }
+
+    // The engine can succeed and still not have fetched a sitemap. A WAF answers a
+    // plain HTTP fetch with its interstitial under a 403, or under a 200, and either
+    // way `fetch` reports success because it did receive a body. The engine ladder
+    // above therefore never advances to the browser -- nothing failed -- and the
+    // parser downstream reports the interstitial as malformed XML. Observed on
+    // zenithbank.com as "XML parsing error: expected '=' not '>' at 1:315", which
+    // ended as zero links and no error anyone could act on.
+    //
+    // So the escalation has to be driven by what came back rather than by whether
+    // the fetch threw. Only a challenge earns the retry: a genuine 404 page is also
+    // non-XML, and sitemap discovery tries a long list of conventional paths, so
+    // retrying every miss in a browser would multiply the cost of the common case.
+    if (usePlaywright && looksLikeChallengeNotSitemap(content)) {
+      logger.warn(
+        "Sitemap fetch returned a challenge page rather than XML; retrying through the browser engine",
+        { method: "getLinksFromSitemap", sitemapUrl },
+      );
+      try {
+        const browserResponse = await scrapeURL(
+          "sitemap;" + crawlId,
+          sitemapUrl,
+          scrapeOptions.parse({
+            formats: ["rawHtml"],
+            useMock: mock,
+            ...(location ? { location } : {}),
+            ...(headers ? { headers } : {}),
+          }),
+          {
+            forceEngine: ["playwright"],
+            v0DisableJsDom: true,
+            orgId: null,
+            teamId: "sitemap",
+            zeroDataRetention,
+          },
+          new CostTracking(),
+        );
+        if (browserResponse.success && browserResponse.document.rawHtml) {
+          const browserContent = browserResponse.document.rawHtml;
+          // Only take it if the browser actually got past the wall. Replacing one
+          // interstitial with another would just relabel the failure.
+          if (!looksLikeChallengeNotSitemap(browserContent)) {
+            logger.info("Browser engine retrieved the sitemap past the challenge", {
+              method: "getLinksFromSitemap",
+              sitemapUrl,
+            });
+            content = browserContent;
+          }
+        }
+      } catch (error) {
+        logger.warn("Browser retry for a challenged sitemap failed", {
+          method: "getLinksFromSitemap",
+          sitemapUrl,
+          error,
+        });
       }
     }
 
