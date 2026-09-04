@@ -37,6 +37,12 @@ const CHALLENGE_MARKERS = [
   "request unsuccessful",
 ];
 
+// Budget for the browser retry below. Chosen to clear the slowest observed
+// challenge solve (21.7s) with room, rather than to be a round number -- the
+// distribution has a long tail and a ceiling near the middle of it turns a working
+// mechanism into a coin-toss.
+const CHALLENGED_SITEMAP_TIMEOUT_MS = 60_000;
+
 // True when a sitemap fetch came back with a bot wall instead of a sitemap.
 //
 // Both halves are needed. A marker alone is not enough: WAFs inject their scripts
@@ -232,6 +238,17 @@ export async function getLinksFromSitemap(
           scrapeOptions.parse({
             formats: ["rawHtml"],
             useMock: mock,
+            // Inheriting the default 15s left this retry losing a race it should
+            // never have been in. Solving a challenge is not a fetch: measured
+            // against zenithbank.com's Imperva wall, the same solve took 7.6s,
+            // 10.2s, 10.6s, 10.9s, 11.7s, 14.3s, 15.5s and 21.7s across runs, so a
+            // 15s ceiling passed or failed by coin-toss -- which is exactly what
+            // "/map returns 1 URL this run and 0 the next" was.
+            //
+            // Only the retry path pays this. Reaching it already established the
+            // site answers with a wall, so the alternative to waiting is not a
+            // faster answer, it is no answer at all.
+            timeout: CHALLENGED_SITEMAP_TIMEOUT_MS,
             ...(location ? { location } : {}),
             ...(headers ? { headers } : {}),
           }),
