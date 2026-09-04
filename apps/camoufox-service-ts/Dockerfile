@@ -122,6 +122,7 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
 # inflating the image.
 COPY api.ts trawl-deps.ts tsconfig.json ./
 COPY helpers/ ./helpers/
+COPY shared/ ./shared/
 COPY trawl/ ./trawl/
 
 RUN pnpm run build

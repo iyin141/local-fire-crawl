@@ -1,3 +1,8 @@
 /node_modules/
 /dist/
 .env
+
+# Tests run locally via vitest, never in the image. tsconfig already excludes them
+# from compilation; keeping them out of the build context too means the fixtures
+# (which include a verbatim 6KB captured interstitial) are not shipped either.
+**/__tests__/
