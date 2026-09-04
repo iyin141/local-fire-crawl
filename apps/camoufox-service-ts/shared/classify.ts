@@ -16,6 +16,7 @@
 import {
   detectChallengeType,
   isBrowserErrorPage,
+  isContentlessWall,
   type ChallengeType,
 } from "../trawl/tiers/utils/detect"
 
@@ -79,8 +80,15 @@ export function classifyContent(
 
   // Challenge first: an interstitial is also thin, and calling it a shell would send
   // it down a retry path that cannot help.
+  //
+  // The marker alone is not enough. Every has*Challenge() predicate also fires on a
+  // page the WAF is serving normally -- Incapsula's cookies and its _Incapsula_Resource
+  // script are present on zenithbank.com's real homepage as much as on its
+  // interstitial. Without the corroboration this layer rejected the 395KB real page
+  // that the tiers had just successfully solved for, which is the same mistake the
+  // tiers themselves were making one level down.
   const waf = detectChallengeType(body, headers, status)
-  if (waf !== "none") return { kind: "challenge", waf }
+  if (waf !== "none" && isContentlessWall(body)) return { kind: "challenge", waf }
 
   if (isBrowserErrorPage(body)) return { kind: "browser_error_page" }
 

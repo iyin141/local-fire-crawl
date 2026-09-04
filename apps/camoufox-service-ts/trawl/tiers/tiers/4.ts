@@ -12,6 +12,7 @@ import {
   isBlocked,
   isBrowserErrorPage,
   isCloudflarePage,
+  isContentlessWall,
 } from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
 import { trackMainDocumentResponses } from "../utils/mainResponse"
@@ -148,7 +149,7 @@ export async function runTier4(
       }
     }
 
-    if (isCloudflarePage(html, mainResponse.headers)) {
+    if (isCloudflarePage(html, mainResponse.headers) && isContentlessWall(html)) {
       return {
         tier: 4,
         status: "blocked",
@@ -157,7 +158,7 @@ export async function runTier4(
       }
     }
 
-    if (hasImpervaChallenge(html)) {
+    if (hasImpervaChallenge(html) && isContentlessWall(html)) {
       return {
         tier: 4,
         status: "blocked",
@@ -166,7 +167,7 @@ export async function runTier4(
       }
     }
 
-    if (hasAkamaiChallenge(html)) {
+    if (hasAkamaiChallenge(html) && isContentlessWall(html)) {
       return {
         tier: 4,
         status: "blocked",
@@ -175,14 +176,14 @@ export async function runTier4(
       }
     }
 
-    if (hasDdosGuardChallenge(html)) {
+    if (hasDdosGuardChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier4] ddos-guard-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
       return { tier: 4, status: "blocked", durationMs: Date.now() - start, reason: "ddos-guard-persistent" }
     }
 
-    if (hasDataDomeChallenge(html)) {
+    if (hasDataDomeChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier4] datadome-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)

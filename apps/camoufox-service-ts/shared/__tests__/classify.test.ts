@@ -91,3 +91,17 @@ describe("challenge is judged before shell", () => {
     expect(verdict.kind).toBe("challenge")
   })
 })
+
+describe("a solved challenge is not re-rejected", () => {
+  // Observed live: with the tiers fixed, Tier 3 returned zenithbank.com's real
+  // homepage at 395,952 bytes -- and this layer threw it away, because the served
+  // page carries the same Imperva cookies its interstitial does. Both levels had to
+  // learn that a marker means "behind a WAF", not "blocked by one".
+  test("a large real page carrying WAF markers is content, not a challenge", () => {
+    const solvedRealPage = `<html><head><title>Zenith Bank - In your best interest</title>
+      <script src="/_Incapsula_Resource?SWJIYLWA=abc"></script></head><body>
+      <main>${"Internet banking, loans and corporate services. ".repeat(200)}</main></body></html>`
+
+    expect(classifyContent(solvedRealPage, {}, 200).kind).toBe("ok")
+  })
+})

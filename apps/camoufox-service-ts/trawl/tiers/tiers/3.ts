@@ -13,6 +13,7 @@ import {
   isBlocked,
   isBrowserErrorPage,
   isCloudflarePage,
+  isContentlessWall,
 } from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
 import { trackMainDocumentResponses } from "../utils/mainResponse"
@@ -183,35 +184,35 @@ export async function runTier3(
       return { tier: 3, status: "error", durationMs: Date.now() - start, reason: errMsg }
     }
 
-    if (isCloudflarePage(html, mainResponse.headers)) {
+    if (isCloudflarePage(html, mainResponse.headers) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] cloudflare-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "cloudflare-persistent" }
     }
 
-    if (hasImpervaChallenge(html)) {
+    if (hasImpervaChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] imperva-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "imperva-persistent" }
     }
 
-    if (hasAkamaiChallenge(html)) {
+    if (hasAkamaiChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] akamai-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "akamai-persistent" }
     }
 
-    if (hasDdosGuardChallenge(html)) {
+    if (hasDdosGuardChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] ddos-guard-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "ddos-guard-persistent" }
     }
 
-    if (hasDataDomeChallenge(html)) {
+    if (hasDataDomeChallenge(html) && isContentlessWall(html)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] datadome-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)

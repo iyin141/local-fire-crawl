@@ -78,6 +78,35 @@ export function isBrowserErrorPage(html: string): boolean {
   return false
 }
 
+// LOCAL ADDITION (not upstream) -- used by the post-solve checks in tiers 3 and 4.
+//
+// Every has*Challenge() predicate keys on markers a WAF also injects into pages it is
+// serving perfectly well: Incapsula sets visid_incap_/incap_ses_/nlbi_ and loads
+// _Incapsula_Resource on protected pages that are working, and Cloudflare behaves
+// comparably. Before a challenge is solved that costs nothing, since a served page and
+// a wall both warrant escalation at that point. Afterwards it inverts --
+// zenithbank.com's real homepage came back from Tier 3 at 395KB with the correct
+// title, still carrying those cookies, and was discarded as "imperva-persistent".
+//
+// So the marker answers "is this site behind a WAF"; something else has to answer "is
+// this page a wall". Readable content separates them where byte length does not: no
+// WAF serves 395KB of article text as an interstitial, and none serve a real page with
+// 760 characters. (isChallengeWall's imperva: 5000 threshold cannot be reused for this
+// -- the interstitial diagnosed against is 6034 bytes, already above it.)
+const WALL_MAX_VISIBLE_TEXT = 2000
+
+export function isContentlessWall(html: string): boolean {
+  const text = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z#0-9]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return text.length < WALL_MAX_VISIBLE_TEXT
+}
+
 export function hasTurnstile(html: string): boolean {
   return (
     /class="cf-turnstile"/i.test(html) ||
@@ -230,7 +259,16 @@ export function detectChallengeType(
 }
 
 export function isBlocked(status: number, html: string): boolean {
+  // Status says blocked on its own authority -- no corroboration needed or wanted.
   if (status === 403 || status === 429) return true
+
+  // LOCAL CHANGE (not upstream): the marker-based arms below need corroboration, for
+  // the reason documented on isContentlessWall. Every one of these predicates also
+  // matches a page the WAF is serving normally, so on their own they report a
+  // successfully fetched 200 as blocked -- which is what "Tier 3 failed (http-200)"
+  // was, on zenithbank.com's real 395KB homepage after its challenge had been solved.
+  if (!isContentlessWall(html)) return false
+
   if (isCloudflarePage(html, {})) return true
   if (hasImpervaChallenge(html)) return true
   if (hasAkamaiChallenge(html)) return true
