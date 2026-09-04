@@ -106,5 +106,12 @@
     "skipLibCheck": true                                 /* Skip type checking all .d.ts files. */
   },
   "include": ["**/*"],
-  "exclude": ["node_modules", "**/*.spec.ts"]
+  // Tests are run by vitest, which transpiles without typechecking, and are excluded
+  // from `tsc` for two reasons. They would otherwise be emitted into dist/ and shipped
+  // in the image, and the vendored ones do not typecheck here at all: they carry
+  // upstream's @trawl/* workspace aliases and patchright's Page type, neither of which
+  // exists in this layout. Both are type-only imports, so vitest erases them and the
+  // tests run correctly -- it is only `tsc` that tries to resolve them, and it does so
+  // while building the production image.
+  "exclude": ["node_modules", "**/*.spec.ts", "**/__tests__/**", "dist"]
 }

@@ -47,7 +47,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /usr/src/app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+# --fetch-timeout is raised well above pnpm's 60s default because this build has to
+# survive a slow link: tarballs here have been observed arriving at 1-40 KiB/s, and a
+# 900KB package (rollup's platform binary, say) simply cannot land inside a minute at
+# that rate. The default aborted this step with "The operation was aborted due to
+# timeout" after 191 of 196 packages, discarding the whole layer. A longer per-request
+# ceiling costs nothing on a fast connection -- it bounds the wait, it does not add to
+# it.
+RUN pnpm install --frozen-lockfile --fetch-timeout=600000
 
 # Everything from here to `pnpm run build` is deliberately ordered so that the
 # browser fetch sits ABOVE the source copy. Docker invalidates every layer after

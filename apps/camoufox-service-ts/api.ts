@@ -7,6 +7,7 @@ import { Server, RequestError } from 'proxy-chain';
 import { ScrapeError, scrape } from './trawl/tiers';
 import type { ScrapeRequest } from './trawl/types';
 import { getTrawlDeps, initTrawlPool, shutdownTrawlPool, wireSsrfProxy } from './trawl-deps';
+import { classifyContent, describeVerdict, warrantsBrowserRetry } from './shared/classify';
 
 dotenv.config();
 
@@ -136,34 +137,6 @@ interface UrlModel {
   skip_tls_verification?: boolean;
 }
 
-const countScriptTags = (html: string): number =>
-  (html.match(/<script\b/gi) ?? []).length;
-
-// Recognises the "client-rendered page that hasn't rendered yet" shape: almost no
-// visible text, but scripts present to produce it. Deliberately conservative --
-// this only decides whether to spend a second attempt through the browser tiers,
-// and a false positive costs one extra scrape while a false negative silently
-// returns an empty page. Thresholds are set so a genuinely small-but-real page
-// (a short article, a 404 with a sentence of text) stays above them.
-const SHELL_MAX_VISIBLE_TEXT = 200;
-
-const looksLikeUnrenderedShell = (html: string): boolean => {
-  if (!html) return false;
-  // A page with no scripts cannot be waiting on JS to render.
-  if (countScriptTags(html) === 0) return false;
-
-  const visibleText = html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&[a-z#0-9]+;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  return visibleText.length < SHELL_MAX_VISIBLE_TEXT;
-};
-
 let poolReady = false;
 
 app.get('/health', async (_req: Request, res: Response) => {
@@ -249,34 +222,49 @@ app.post('/scrape', async (req: Request, res: Response) => {
   try {
     let result = await scrape(scrapeReq, getTrawlDeps());
 
-    // Tier 1 is a plain fetch: it reports success for any 200 carrying markup,
-    // including a client-rendered shell whose real content only exists after JS
-    // runs. trawl escalates past anti-bot *challenges*, not past "this page needs
-    // a browser to render", so nothing below this layer will catch that -- a
-    // Vite/React SPA returns ~500 bytes of <div id="root"></div> and reads as a
-    // clean win. Retry those through the browser tiers, where the JS actually
-    // executes. Only ever costs a second attempt on pages that came back looking
-    // empty, and only when Tier 1 was the one that answered.
-    if (result.tier === 1 && looksLikeUnrenderedShell(result.html)) {
-      console.log(
-        `↻ Tier 1 returned what looks like an unrendered shell (${result.html.length}B, ${countScriptTags(result.html)} script tags) -- retrying via browser tiers`,
-      );
+    // Re-judge what came back, against the whole body rather than whichever window
+    // the answering tier happened to use. Tier 1 detects against a bounded 4096-byte
+    // preview, so a challenge marker beyond it -- zenithbank.com's sits at 4865 --
+    // reaches here labelled a successful scrape. Two shapes are worth one more
+    // attempt through the browser tiers: a challenge trawl did not see, and a
+    // client-rendered shell trawl does not look for at all. Both are answered by a
+    // browser; a plain fetch cannot improve on either.
+    let verdict = classifyContent(result.html, result.responseHeaders ?? {}, result.statusCode);
+
+    if (warrantsBrowserRetry(verdict) && result.tier === 1) {
+      console.log(`↻ Tier 1 returned ${describeVerdict(verdict, result.html)} -- retrying via browser tiers`);
       try {
         result = await scrape({ ...scrapeReq, skipHttp: true }, getTrawlDeps());
+        verdict = classifyContent(result.html, result.responseHeaders ?? {}, result.statusCode);
       } catch (retryError) {
-        // The shell was a valid 200. If the browser path can't do better, keep it
-        // rather than turning a thin success into a failure.
+        // The original was a valid 200. If the browser path cannot do better, keep
+        // it rather than turning a thin success into a hard failure.
         console.warn(
-          `↻ Browser-tier retry failed, keeping the Tier 1 shell: ${retryError instanceof Error ? retryError.message : retryError}`,
+          `↻ Browser-tier retry failed, keeping the Tier 1 result: ${retryError instanceof Error ? retryError.message : retryError}`,
         );
       }
     }
 
-    const pageError =
-      result.statusCode !== 200 ? getError(result.statusCode) : undefined;
+    // A challenge page that survived the browser tiers is not content, and saying so
+    // is the honest answer. Reporting it as a 200 is what let an Imperva interstitial
+    // be stored as a bank's homepage and have "links" extracted from it. Surfacing it
+    // as a block instead lets Firecrawl fall through to its remaining engines and,
+    // failing those, lets the mapping service's existing WAF handling see it for what
+    // it is.
+    const blockedByChallenge = verdict.kind === "challenge";
+
+    const pageError = blockedByChallenge
+      ? `Blocked by ${(verdict as { waf: string }).waf} challenge`
+      : result.statusCode !== 200
+        ? getError(result.statusCode)
+        : undefined;
 
     if (!pageError) {
       console.log(`✅ Scrape successful! (tier ${result.tier}, ${result.totalMs}ms)`);
+    } else if (blockedByChallenge) {
+      console.log(
+        `🚫 ${describeVerdict(verdict, result.html)} survived tier ${result.tier} -- reporting as blocked`,
+      );
     } else {
       console.log(
         `🚨 Scrape failed with status code: ${result.statusCode} ${pageError} (tier ${result.tier})`,
@@ -285,7 +273,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
 
     res.json({
       content: result.html,
-      pageStatusCode: result.statusCode,
+      pageStatusCode: blockedByChallenge ? 403 : result.statusCode,
       contentType: result.contentType,
       ...(pageError && { pageError }),
     });
