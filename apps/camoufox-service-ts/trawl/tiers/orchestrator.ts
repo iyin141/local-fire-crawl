@@ -61,6 +61,30 @@ const extractDomain = (url: string): string => {
 const hasUsablePayload = (result: { status: TierResult["status"]; html?: string; body?: Uint8Array }): boolean =>
   result.status === "success" && (result.body !== undefined || Boolean(result.html))
 
+// LOCAL CHANGE (see trawl/README-LOCAL-CHANGES if present): the per-tier budget
+// was computed as `maxTimeout - (Date.now() - totalStart)` at six call sites and
+// clamped at only two of them (the acquireBrowser calls). Once tiers 1-2 had
+// consumed the whole budget the value went negative and was handed straight to
+// page.goto, which rejects immediately with "Timeout -1047728ms exceeded".
+//
+// Observed on aradel.com and vfdgroup.com, both Cloudflare: the logs show
+// Tier 3 clicking through the Turnstile challenge and then dying on a negative
+// deadline -- the tier that actually solves Cloudflare was given less than no
+// time to finish the solve it had already started, and the failure surfaced as
+// "All tiers exhausted", indistinguishable from a site we genuinely cannot read.
+//
+// Clamping to 0 alone would only turn an instant negative-timeout error into an
+// instant zero-timeout error. A tier needs a workable slice of time to mean
+// anything, so below MIN_TIER_BUDGET_MS we stop and report exhaustion honestly
+// rather than burning a browser navigation that cannot succeed.
+const MIN_TIER_BUDGET_MS = 2_000
+
+const remainingBudget = (maxTimeout: number, totalStart: number): number =>
+  Math.max(maxTimeout - (Date.now() - totalStart), 0)
+
+const budgetExhausted = (maxTimeout: number, totalStart: number): boolean =>
+  remainingBudget(maxTimeout, totalStart) < MIN_TIER_BUDGET_MS
+
 export async function scrape(
   req: ScrapeRequest,
   deps: OrchestratorDeps,
@@ -131,14 +155,14 @@ export async function scrape(
   // Acquire browser for tiers 2-4
   // Pass our own budget so the pool's stall detector doesn't reclaim this browser
   // while the request is still inside the time the caller asked for.
-  let handle = await deps.acquireBrowser(domain, Math.max(maxTimeout - (Date.now() - totalStart), 0), { headful })
+  let handle = await deps.acquireBrowser(domain, remainingBudget(maxTimeout, totalStart), { headful })
   let handleReleased = false
 
   const switchToHeadful = async (): Promise<void> => {
     if (handle.headful) return
     deps.releaseBrowser(handle)
     handleReleased = true
-    handle = await deps.acquireBrowser(domain, Math.max(maxTimeout - (Date.now() - totalStart), 0), { headful: true })
+    handle = await deps.acquireBrowser(domain, remainingBudget(maxTimeout, totalStart), { headful: true })
     handleReleased = false
   }
 
@@ -149,8 +173,8 @@ export async function scrape(
     // creation, so it cannot honour a per-request skipTlsVerification. Skipping
     // straight to Tier 3 (which builds a fresh context per request) is the only
     // way to actually respect the flag rather than silently dropping it.
-    if (session && maxTier >= 2 && !req.skipTlsVerification) {
-      const remaining = maxTimeout - (Date.now() - totalStart)
+    if (session && maxTier >= 2 && !req.skipTlsVerification && !budgetExhausted(maxTimeout, totalStart)) {
+      const remaining = remainingBudget(maxTimeout, totalStart)
       const tier2Runner = runners.tier2 ?? runTier2
       let t2 = await tier2Runner(
         req.url,
@@ -168,7 +192,7 @@ export async function scrape(
           req.url,
           handle,
           session,
-          maxTimeout - (Date.now() - totalStart),
+          remainingBudget(maxTimeout, totalStart),
           sanitizedHeaders,
           req.method,
           req.body,
@@ -209,6 +233,13 @@ export async function scrape(
       throw new ScrapeError("Max tier reached without success", timings)
     }
 
+    if (budgetExhausted(maxTimeout, totalStart)) {
+      throw new ScrapeError(
+        `Timeout budget of ${maxTimeout}ms exhausted before Tier 3 could run`,
+        timings,
+      )
+    }
+
     // Tier 3: fresh challenge solve. Proxy resolves from (priority order) a per-request
     // override, then the configured datacenter proxy pool, then none (server's own IP).
     // On a "blocked" result from a pool-sourced proxy, mark it bad and retry with the
@@ -217,7 +248,7 @@ export async function scrape(
     let proxy3 = req.proxy ?? deps.proxyPool?.next(domain) ?? undefined
     let t3: Awaited<ReturnType<typeof runTier3>>
     for (let attempt = 0; ; attempt++) {
-      const remaining3 = maxTimeout - (Date.now() - totalStart)
+      const remaining3 = remainingBudget(maxTimeout, totalStart)
       const tier3Runner = runners.tier3 ?? runTier3
       t3 = await tier3Runner(req.url, handle, remaining3, proxy3, sanitizedHeaders, req.method, req.body, tierOpts)
       if (t3.challenge === "datadome" && !handle.headful) {
@@ -225,7 +256,7 @@ export async function scrape(
         t3 = await tier3Runner(
           req.url,
           handle,
-          maxTimeout - (Date.now() - totalStart),
+          remainingBudget(maxTimeout, totalStart),
           proxy3,
           sanitizedHeaders,
           req.method,
@@ -286,18 +317,25 @@ export async function scrape(
       )
     }
 
+    if (budgetExhausted(maxTimeout, totalStart)) {
+      throw new ScrapeError(
+        `Timeout budget of ${maxTimeout}ms exhausted before Tier 4 could run`,
+        timings,
+      )
+    }
+
     let t4: Awaited<ReturnType<typeof runTier4>>
     const runTier4Lazy = runners.tier4 ?? (await import("./tiers/4")).runTier4
     for (let attempt = 0; ; attempt++) {
       console.log(`[orchestrator] Tier 4 via residential proxy: ${proxy4.replace(/\/\/[^@]*@/, "//**@")}`)
-      const remaining4 = maxTimeout - (Date.now() - totalStart)
+      const remaining4 = remainingBudget(maxTimeout, totalStart)
       t4 = await runTier4Lazy(req.url, handle, remaining4, proxy4, sanitizedHeaders, req.method, req.body, tierOpts)
       if (t4.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
         t4 = await runTier4Lazy(
           req.url,
           handle,
-          maxTimeout - (Date.now() - totalStart),
+          remainingBudget(maxTimeout, totalStart),
           proxy4,
           sanitizedHeaders,
           req.method,
