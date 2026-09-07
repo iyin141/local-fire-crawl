@@ -116,6 +116,13 @@ services:
       PROXY_LIST_FILE: ${TIER3_PROXY_LIST_FILE}
       RESIDENTIAL_PROXY_URL: ${RESIDENTIAL_PROXY_URL}
       RESIDENTIAL_PROXY_LIST_FILE: ${RESIDENTIAL_PROXY_LIST_FILE}
+      # Voluntary sticky handoff on top of the pools above -- hand a domain to a
+      # different proxy once one has held it this long, then keep that pairing
+      # rested for a while. Both optional; unset keeps the pool's original
+      # "sticky until the proxy fails" behaviour. See .env for the rationale
+      # (a residential IP that never changes is itself an anomaly signal).
+      PROXY_DOMAIN_QUANTUM_MINUTES: ${PROXY_DOMAIN_QUANTUM_MINUTES}
+      PROXY_DOMAIN_REST_MINUTES: ${PROXY_DOMAIN_REST_MINUTES}
     depends_on:
       - redis
     # No host port published: like the playwright-service it replaces, this is

@@ -78,27 +78,69 @@ actually confirms the infra is sound.
 Oracle Cloud's outbound IP ranges are known-datacenter and score higher-risk
 with most WAFs (Cloudflare, Imperva, Akamai) regardless of Camoufox's
 fingerprint quality — that's why the Cloudflare check above is expected to
-struggle tonight. Buy **rotating residential**, not static/dedicated — trawl
-already does its own sticky-per-domain proxy pinning
-(`trawl/tiers/utils/proxyRotator.ts`'s `ProxyPool`, with round-robin across
-domains and a 5-minute cooldown on failure), so a single static IP would
-just hand it a pool of one, losing the fault-isolation the code already
-does for you.
+struggle without one.
 
-Fill in the three placeholders already scaffolded in `.env`:
+**Buy static/dedicated residential, not a rotating gateway.** An earlier
+version of this doc said the opposite; a live 159-source rescan on 2026-09-07
+settled it against rotating:
+
+- A rotating gateway assigns a **fresh exit node per connection**, and a
+  single `/v2/map` call opens several (homepage, robots.txt, sitemap.xml,
+  sitemap_index.xml). Each one is an independent gamble on an unknown node.
+- Measured on that run: **45 `Proxy response (502) !== 200 when HTTP
+  Tunneling` failures and 34 `Sitemap fetch aborted`** in one log. Sources
+  collapsed to their shallow homepage fallback — marketforcesafrica
+  22,002 → 26 links, pencom 958 → 0.
+- Switching to sticky sessions fixed those two specific sources (verified
+  3/3), but a second full rescan regressed again under sustained load,
+  because 5 sticky sessions were serving 159 domains — roughly 32 domains
+  per residential device.
+
+Static IPs remove both problems: no per-connection reassignment, and a pool
+big enough that no single device carries the whole workload. Trawl's own
+`ProxyPool` (`trawl/tiers/utils/proxyRotator.ts`) then does round-robin,
+sticky-per-domain pinning, and a 5-minute cooldown across whatever list you
+give it.
+
+Fill in the placeholders scaffolded in `.env` — **both list vars take a
+comma-separated list**, so paste every IP into each:
 
 ```
-PROXY_SERVER=          # + PROXY_USERNAME / PROXY_PASSWORD if issued separately
-                        # covers the api container's fetch/pdf/document/image engines
-RESIDENTIAL_PROXY_URL= # covers camoufox-service's Tier 4 escalation (Playwright's own proxy option)
-# TIER3_PROXY_URL=     # optional: also route Tier 3's challenge-solving browser through it,
-                        # at the cost of more proxy bandwidth per request
+# api container's fetch/pdf/document/image engines (this includes /v2/map's
+# own sitemap fetch, which is why a single value here throttled the rescan)
+PROXY_SERVER=http://u:p@ip1:80,http://u:p@ip2:80,...
+PROXY_USERNAME=      # optional shared fallback if creds aren't embedded per-URL
+PROXY_PASSWORD=
+
+# camoufox-service's Tier 4 escalation (Playwright's own proxy option)
+RESIDENTIAL_PROXY_URL=http://u:p@ip1:80,http://u:p@ip2:80,...
+
+# optional: also route Tier 3's challenge-solving browser through the pool,
+# at the cost of more proxy bandwidth per request
+# TIER3_PROXY_URL=
 ```
 
-These are three separate mechanisms (a Node HTTP dispatcher, a Playwright
-browser launch option, and — if the mapping service ever deploys alongside
-this — Python's own `HTTP_PROXY`/`HTTPS_PROXY` convention) covering disjoint
-code paths; setting one doesn't cover the others, and none conflict.
+These are separate mechanisms covering disjoint code paths (a Node HTTP
+dispatcher, a Playwright browser launch option, and — if the mapping service
+ever deploys alongside this — Python's own `HTTP_PROXY`/`HTTPS_PROXY`
+convention). Setting one does not cover the others, and none conflict.
+
+### Optional: voluntary sticky handoff
+
+Sticky-per-domain pins one IP to one site until that IP *fails*. Over weeks
+that permanence is its own tell — real residential IPs churn (mobile carriers
+reassign on every data toggle, home broadband on lease renewal). Two optional
+vars add a scheduled handoff on top:
+
+```
+PROXY_DOMAIN_QUANTUM_MINUTES=   # hold a (domain, proxy) pairing this long, then hand off
+PROXY_DOMAIN_REST_MINUTES=      # keep that domain off that proxy for this long afterwards
+```
+
+Both **default to off** — unset means the original "sticky until failure"
+behaviour, which is what keeps a local run with no proxy at all unaffected.
+Only meaningful with a multi-IP pool; with one proxy there is nothing to hand
+off to.
 
 Then:
 
@@ -106,5 +148,6 @@ Then:
 docker compose up -d camoufox-service api   # restart just these two to pick up the new env
 ```
 
-Re-run the vfdgroup check from §4 — that's the confirmation the proxy is
-actually taking effect, not just configured.
+Re-run the vfdgroup check from §4 — but **under sustained load, not three
+isolated calls**. Three passing calls is exactly what preceded the second
+rescan regressing; concentration only shows up at volume.
