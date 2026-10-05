@@ -8,6 +8,9 @@ import { ScrapeError, scrape } from './trawl/tiers';
 import type { ScrapeRequest } from './trawl/types';
 import { getTrawlDeps, initTrawlPool, shutdownTrawlPool, wireSsrfProxy } from './trawl-deps';
 import { classifyContent, describeVerdict, warrantsBrowserRetry } from './shared/classify';
+import { closeTemporaryContext, newFreshContext } from './trawl/browser';
+import { routeChallengeWait } from './trawl/tiers/utils/challengeRouter';
+import { BadRequest, captureScreenshot, validateScreenshotRequest } from './screenshot';
 
 dotenv.config();
 
@@ -143,7 +146,7 @@ app.get('/health', async (_req: Request, res: Response) => {
   if (!poolReady) {
     return res.status(503).json({ status: 'unhealthy', error: 'browser pool not initialized' });
   }
-  res.status(200).json({ status: 'healthy', engine: 'camoufox+trawl' });
+  res.status(200).json({ status: 'healthy', engine: 'camoufox+trawl', screenshot: true });
 });
 
 app.post('/scrape', async (req: Request, res: Response) => {
@@ -297,6 +300,49 @@ app.post('/scrape', async (req: Request, res: Response) => {
     res
       .status(500)
       .json({ error: 'An error occurred while fetching the page.' });
+  }
+});
+
+// POST /screenshot -- a picture of a page, or of one element of it (selector or quoted text). See screenshot.ts and the README.
+// Same SSRF guard as /scrape; browser tiers only; a page still behind a WAF challenge comes back as status "blocked", never as a picture.
+app.post('/screenshot', async (req: Request, res: Response) => {
+  let parsed;
+  try {
+    parsed = validateScreenshotRequest(req.body);
+  } catch (error) {
+    if (error instanceof BadRequest) return res.status(400).json({ status: 'error', error: error.message });
+    throw error;
+  }
+  if (!isValidUrl(parsed.url)) {
+    return res.status(400).json({ status: 'error', error: 'Invalid URL' });
+  }
+  try {
+    await assertSafeTargetUrl(parsed.url);
+  } catch (error) {
+    if (error instanceof InsecureConnectionError) {
+      return res.status(403).json({ status: 'error', pageError: error.message });
+    }
+    throw error;
+  }
+  if (!poolReady) {
+    return res.status(503).json({ status: 'error', error: 'Browser pool not ready yet' });
+  }
+  console.log(`Screenshot request: ${parsed.url} target=${parsed.target === undefined ? 'none' : typeof parsed.target === 'string' ? 'selector' : 'text'} full_page=${parsed.full_page}`);
+  try {
+    const trawl = getTrawlDeps();
+    const result = await captureScreenshot(parsed, {
+      acquireBrowser: trawl.acquireBrowser,
+      releaseBrowser: trawl.releaseBrowser,
+      newContext: (browser, opts) => newFreshContext(browser, opts),
+      closeContext: (ctx, requestReplacement) => closeTemporaryContext(ctx, requestReplacement, 'screenshot context cleanup timed out'),
+      waitChallenge: (page, html, headers, timeoutMs, url, status) =>
+        routeChallengeWait(page, html, headers, timeoutMs, url, undefined, status),
+      classify: (html, headers, status) => classifyContent(html, headers, status) as { kind: string; waf?: string },
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Screenshot error:', error);
+    res.status(500).json({ status: 'error', error: 'An error occurred while taking the screenshot.' });
   }
 });
 

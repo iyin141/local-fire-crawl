@@ -120,7 +120,7 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
 # the bytes are already committed to a lower layer. Listing sources also means a
 # new top-level file has to be added here consciously rather than silently
 # inflating the image.
-COPY api.ts trawl-deps.ts tsconfig.json ./
+COPY api.ts trawl-deps.ts screenshot.ts screenshotHideSelectors.ts tsconfig.json ./
 COPY helpers/ ./helpers/
 COPY shared/ ./shared/
 COPY trawl/ ./trawl/

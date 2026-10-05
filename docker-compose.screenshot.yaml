@@ -1,0 +1,8 @@
+# Optional override: publish the camoufox-service on the host's loopback so a local tool can call POST /screenshot (see
+# apps/camoufox-service-ts/README.md). Loopback only: the service has no authentication.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.screenshot.yaml up -d --build camoufox-service
+services:
+  camoufox-service:
+    ports:
+      - "127.0.0.1:${CAMOUFOX_HOST_PORT:-3004}:3000"
