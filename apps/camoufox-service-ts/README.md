@@ -42,6 +42,12 @@ The service stays general: nothing here knows about that pipeline. Firecrawl's e
   The request is limited to one pooled browser, always released and its context closed, on every path. A picture over 8 MB is refused.
   Bad input is HTTP 400.
 
+### Through the Firecrawl API (one public door)
+
+`POST /v1/scrape/screenshot` on the Firecrawl API forwards the same request and returns the same answer, so nothing else needs a published port. It uses the
+same auth middleware as `/v1/scrape` and reaches this service at `PLAYWRIGHT_MICROSERVICE_URL` with `/scrape` replaced by `/screenshot`. A pipeline sets
+`CAMOUFOX_SERVICE_URL=https://<host>/fire-crawl/v1/scrape` and appends `/screenshot` itself. See `apps/api/src/controllers/v1/scrape-screenshot.ts`.
+
 ### Reaching it from the host
 
 By default no host port is published (the api reaches this service over the backend network). To use `/screenshot` from the host, add the loopback-only

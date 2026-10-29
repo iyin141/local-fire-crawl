@@ -2,6 +2,7 @@ import express from "express";
 import { crawlController } from "../controllers/v1/crawl";
 // import { crawlStatusController } from "../../src/controllers/v1/crawl-status";
 import { scrapeController } from "../../src/controllers/v1/scrape";
+import { scrapeScreenshotController } from "../controllers/v1/scrape-screenshot";
 import { crawlStatusController } from "../controllers/v1/crawl-status";
 import { mapController } from "../controllers/v1/map";
 import { RateLimiterMode } from "../types";
@@ -54,6 +55,15 @@ v1Router.post(
   checkCreditsMiddleware(1),
   scrapeBlocklistMiddleware,
   wrap(scrapeController),
+);
+
+// LOCAL CHANGE: one public door for the camoufox-service screenshot (see controllers/v1/scrape-screenshot.ts)
+v1Router.post(
+  "/scrape/screenshot",
+  authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
+  countryCheck,
+  scrapeBlocklistMiddleware,
+  wrap(scrapeScreenshotController),
 );
 
 v1Router.post(
