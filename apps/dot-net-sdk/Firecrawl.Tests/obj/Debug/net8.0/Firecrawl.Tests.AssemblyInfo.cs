@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Firecrawl.Tests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+92ec10faa132ee4dc10ce291b838aff53ac91256")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+32a957578c0f89832076793594e2733bf3131a6c")]
 [assembly: System.Reflection.AssemblyProductAttribute("Firecrawl.Tests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Firecrawl.Tests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
