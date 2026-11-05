@@ -1,6 +1,10 @@
 name: Check-bats-version
 run-name: ${{ github.actor }} is learning GitHub Actions
-on: [push]
+on: 
+  push:
+    branches:
+         - main
+     
 jobs:
   check-bats-version:
     runs-on: ubuntu-latest
@@ -11,3 +15,7 @@ jobs:
           node-version: '24'
       - run: npm install -g bats
       - run: bats -v # check bats installed correctly
+      - name: build the image
+        run : docker compose build
+      - name : run the image
+        run: docker compose up
