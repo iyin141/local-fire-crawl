@@ -1,13 +1,13 @@
-name: Deploy-to-vm
+name: Check-bats-version
 run-name: ${{ github.actor }} is learning GitHub Actions
 on: [push]
 jobs:
-   check-bats-version:
-    runs-on: unbuntu-latest
+  check-bats-version:
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
-    - uses: actions/setup-node@v7
-       with:
-       node-version: '24'
-    - run : npm install -g bats
-    - run : bots -v
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: npm install -g bats
+      - run: bats -v # check bats installed correctly
